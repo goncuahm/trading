@@ -21,10 +21,10 @@ period = st.sidebar.selectbox("Data Period", ["6mo", "1y", "2y", "5y"], index=1)
 tcost = st.sidebar.number_input("Transaction Cost (e.g., 0.002 = 0.4%)", value=0.0020, step=0.0005)
 capital = st.sidebar.number_input("Initial Capital (TRY)", value=1_000_000, step=50_000)
 rsi_period = st.sidebar.slider("RSI Period", 5, 30, 9)
-search_low = st.sidebar.slider("Buy Threshold Range Start", 10, 45, 33)
-search_high = st.sidebar.slider("Sell Threshold Range Start", 55, 90, 63)
+search_low = 20 # st.sidebar.slider("Buy Threshold Range Start", 10, 45, 20)
+search_high = 60 # st.sidebar.slider("Sell Threshold Range Start", 55, 90, 60)
 
-st.sidebar.write("Select the ranges where optimal RSI thresholds will be searched.")
+# st.sidebar.write("Select the ranges where optimal RSI thresholds will be searched.")
 
 # ------------------------------
 # Download Data

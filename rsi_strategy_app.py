@@ -138,9 +138,9 @@ else:
 required_cols = [c for c in ["Close", "RSI1"] if c in df.columns]
 recent = df.tail(20)[required_cols].dropna()
 
-# recent = df.tail(20).dropna(subset=["Close", "RSI1"])
-x = recent["Close"].to_numpy()
-y = recent["RSI1"].to_numpy()
+x = recent["Close"].to_numpy().flatten()
+y = recent["RSI1"].to_numpy().flatten()
+
 
 if len(x) >= 2:
     a, b = np.polyfit(x, y, 1)

@@ -112,8 +112,10 @@ st.pyplot(fig)
 # ------------------------------
 # Latest Signal Estimation
 # ------------------------------
-latest_close = df["Close"].iloc[-1]
-latest_rsi = df["RSI1"].iloc[-1]
+# latest_close = df["Close"].iloc[-1]
+# latest_rsi = df["RSI1"].iloc[-1]
+latest_close = float(df["Close"].iloc[-1])
+latest_rsi = float(df["RSI1"].iloc[-1])
 
 if latest_rsi < buy_threshold:
     signal = "BUY"

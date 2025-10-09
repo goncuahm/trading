@@ -18,11 +18,11 @@ st.sidebar.header("🔧 User Parameters")
 
 ticker = st.sidebar.text_input("Ticker Symbol (e.g., XU030.IS)", "XU030.IS")
 period = st.sidebar.selectbox("Data Period", ["6mo", "1y", "2y", "5y"], index=1)
-tcost = st.sidebar.number_input("Transaction Cost (e.g., 0.002 = 0.2%)", value=0.0020, step=0.0005)
+tcost = st.sidebar.number_input("Transaction Cost (e.g., 0.002 = 0.4%)", value=0.0020, step=0.0005)
 capital = st.sidebar.number_input("Initial Capital (TRY)", value=1_000_000, step=50_000)
 rsi_period = st.sidebar.slider("RSI Period", 5, 30, 9)
-search_low = st.sidebar.slider("Buy Threshold Range Start", 10, 50, 25)
-search_high = st.sidebar.slider("Sell Threshold Range Start", 50, 90, 55)
+search_low = st.sidebar.slider("Buy Threshold Range Start", 10, 45, 33)
+search_high = st.sidebar.slider("Sell Threshold Range Start", 55, 90, 63)
 
 st.sidebar.write("Select the ranges where optimal RSI thresholds will be searched.")
 

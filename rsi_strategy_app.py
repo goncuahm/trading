@@ -84,7 +84,7 @@ def backtest_strategy(df, x1, x2):
 total_return, trades = backtest_strategy(df, buy_threshold, sell_threshold)
 
 st.success(f"✅ RSI thresholds used: Buy = {buy_threshold}, Sell = {sell_threshold}")
-st.write(f"**Total Return:** {total_return:.2f} | **Number of Trades:** {len(trades)}| **Return per Trade:** {total_return/len(trades)}")
+st.write(f"**Total Return:** {total_return:.2f} | **Number of Trades:** {len(trades)}| **Return per Trade:** {total_return/len(trades):.2f}")
 
 # ------------------------------
 # Plot Results

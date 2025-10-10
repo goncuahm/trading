@@ -3,3 +3,5 @@ yfinance
 pandas
 numpy
 matplotlib
+tensorflow==2.17.0
+scikit-learn

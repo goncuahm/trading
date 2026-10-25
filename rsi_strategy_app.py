@@ -44,6 +44,13 @@ rsi_entry_short = st.sidebar.slider("Short Entry: RSI above", 50, 90, 67)
 max_holding_days = st.sidebar.slider("Max Holding Days", 5, 60, 22)
 
 st.sidebar.markdown("---")
+st.sidebar.subheader("💰 RSI Accumulation (IRR) Strategy")
+acc_rsi_days = st.sidebar.slider("RSI Period (Accumulation)", 5, 30, 14)
+acc_th_range = st.sidebar.slider("RSI threshold search range (buy 1 share when RSI below)", 5, 95, (10, 70))
+acc_min_buys = st.sidebar.slider("Minimum number of purchases for a valid threshold", 1, 100, 10)
+acc_include_cost = st.sidebar.checkbox("Include transaction cost on each purchase", value=True)
+
+st.sidebar.markdown("---")
 st.sidebar.subheader("🕯️ Heikin-Ashi Strategy")
 ha_execution = st.sidebar.selectbox(
     "Execute trades at (Heikin-Ashi)",
@@ -469,10 +476,77 @@ def draw_ha_candles(ax, ha, width=0.6):
 
 
 # =====================================================
+# RSI ACCUMULATION STRATEGY — buy one share on every day RSI < threshold,
+# never sell; measure the internal rate of return (IRR)
+# =====================================================
+
+def solve_irr(outlays, tau, terminal_value, lo=-5.0, hi=5.0, tol=1e-10, max_iter=200):
+    """
+    Continuously compounded annual rate r solving
+        sum_i outlay_i * exp(r * tau_i) = terminal_value,
+    where tau_i = years from purchase i to the valuation date T.
+    The left side is increasing in r (all outlays > 0), so the root is unique; bisection.
+    """
+    outlays = np.asarray(outlays, float); tau = np.asarray(tau, float)
+    if len(outlays) == 0 or terminal_value <= 0:
+        return np.nan
+    f = lambda r: np.sum(outlays * np.exp(r * tau)) - terminal_value
+    f_lo, f_hi = f(lo), f(hi)
+    if f_lo > 0 or f_hi < 0:
+        return np.nan
+    for _ in range(max_iter):
+        mid = 0.5 * (lo + hi)
+        if f(mid) > 0:
+            hi = mid
+        else:
+            lo = mid
+        if hi - lo < tol:
+            break
+    return 0.5 * (lo + hi)
+
+
+def accumulation_result(df, rsi_vals, threshold, include_cost=True):
+    """Buy one share at the close on every day with RSI < threshold; hold to the last date T."""
+    C = df['Close'].values
+    mask = (rsi_vals < threshold) & ~np.isnan(rsi_vals)
+    idx = np.where(mask)[0]
+    T = df.index[-1]
+    cost_mult = (1 + TRANSACTION_COST) if include_cost else 1.0
+    outlays = C[idx] * cost_mult
+    tau = (T - df.index[idx]).days.values / 365.25
+    n_sh = len(idx)
+    terminal = C[-1] * n_sh
+    r = solve_irr(outlays, tau, terminal)
+    return {
+        "threshold": threshold, "buys": n_sh, "invested": outlays.sum(),
+        "final_value": terminal, "profit": terminal - outlays.sum(),
+        "irr_cont": r, "irr_eff": np.exp(r) - 1 if np.isfinite(r) else np.nan,
+        "avg_price": outlays.sum() / n_sh if n_sh else np.nan,
+        "idx": idx, "outlays": outlays, "tau": tau,
+    }
+
+
+def accumulation_path(df, idx, outlays, rf_cont):
+    """Daily path: cumulative cash invested, market value of shares held, and the same
+    cash flows compounded at the risk-free rate."""
+    n = len(df)
+    shares = np.zeros(n); cash_in = np.zeros(n); rf_flow = np.zeros(n)
+    np.add.at(shares, idx, 1); np.add.at(cash_in, idx, outlays)
+    shares = np.cumsum(shares); invested = np.cumsum(cash_in)
+    t_years = (df.index - df.index[0]).days.values / 365.25
+    # value at t of all outlays made up to t, compounded at rf: sum outlay_i * exp(rf (t - t_i))
+    disc = np.cumsum(cash_in * np.exp(-rf_cont * t_years))
+    rf_value = disc * np.exp(rf_cont * t_years)
+    mkt_value = shares * df['Close'].values
+    return pd.DataFrame({"Shares": shares, "Invested": invested, "Market value": mkt_value,
+                         "Same cash at risk-free": rf_value}, index=df.index)
+
+
+# =====================================================
 # MAIN APP
 # =====================================================
 
-st.title("📊 Strategy Suite — RSI Pivot + Long/Short + Heikin-Ashi")
+st.title("📊 Strategy Suite — RSI Accumulation + Long/Short + Heikin-Ashi")
 
 data = download_stock_data(TICKER, str(START), END)
 
@@ -485,105 +559,199 @@ st.success(f"Downloaded **{len(data)}** trading days for **{TICKER}**  |  {str(S
 # ─────────────────────────────────────────────
 # TAB LAYOUT
 # ─────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs(["🔁 RSI Pivot Strategy", "📈 Long / Short Strategies",
+tab1, tab2, tab3 = st.tabs(["💰 RSI Accumulation (IRR)", "📈 Long / Short Strategies",
                              "🕯️ Heikin-Ashi Strategy"])
 
 # =====================================================
-# TAB 1 — original RSI pivot strategy (unchanged)
+# TAB 1 — RSI accumulation strategy (IRR)
 # =====================================================
 with tab1:
-    st.subheader("RSI Pivot Strategy Optimizer")
+    st.subheader("RSI Accumulation — Buy One Share Every Day the RSI Is Below the Threshold, Never Sell")
 
-    split_index = int(len(data) * 0.75)
-    train_data = data.iloc[:split_index]
-    test_data  = data.iloc[split_index:]
-
-    rsi_range    = [9, 10, 11]
-    pivot_range  = [3, 5, 7, 10]
-    bottom_range = [25, 30, 33, 37, 40]
-    peak_range   = [66, 71, 75, 77, 80]
-
-    best_score  = -999
-    best_params = None
-
-    with st.spinner("Optimizing Pivot parameters…"):
-        for rsi_len in rsi_range:
-            for pivot_lb in pivot_range:
-                for bottom_th in bottom_range:
-                    for peak_th in peak_range:
-                        if peak_th <= bottom_th:
-                            continue
-                        _, _, sharpe, _ = backtest_strategy(
-                            train_data, rsi_len, pivot_lb, bottom_th, peak_th, 0.0
-                        )
-                        if sharpe > best_score:
-                            best_score  = sharpe
-                            best_params = (rsi_len, pivot_lb, bottom_th, peak_th)
-
-    col_p1, col_p2, col_p3, col_p4, col_p5 = st.columns(5)
-    col_p1.metric("RSI Length",      best_params[0])
-    col_p2.metric("Pivot Lookback",  best_params[1])
-    col_p3.metric("Bottom Thresh.",  best_params[2])
-    col_p4.metric("Peak Thresh.",    best_params[3])
-    col_p5.metric("Train Sharpe",    f"{best_score:.2f}")
-
-    train_df, train_ret, train_sharpe, train_dd = backtest_strategy(
-        train_data, *best_params, RISK_FREE_RATE_ANNUAL
-    )
-    test_df, test_ret, test_sharpe, test_dd = backtest_strategy(
-        test_data, *best_params, RISK_FREE_RATE_ANNUAL
+    rf_cont = np.log(1 + RISK_FREE_RATE_ANNUAL)
+    st.info(
+        f"**Rule** — RSI period **{acc_rsi_days}**. On **every** day the RSI closes below the threshold, buy "
+        "**one share** at the close and keep it for life (no sales).\n\n"
+        "**Internal rate of return** — with purchases on dates t₁ … tₙ and N shares in total, r solves  "
+        "**Σ S(tᵢ)·e^{r(T − tᵢ)} = S(T)·N**, where T is the last date and time is in years. "
+        f"Purchases {'include' if acc_include_cost else 'exclude'} the {TRANSACTION_COST*100:.1f}% cost; "
+        "the shares are valued at the last close.\n\n"
+        f"The threshold is chosen from {acc_th_range[0]} to {acc_th_range[1]} to **maximise r** (at least "
+        f"{acc_min_buys} purchases). Benchmarks: **buy & hold** (one share bought on the first day), "
+        "**buy one share every day** (the same plan without the RSI filter), and the **risk-free rate**."
     )
 
-    buy_hold_train = 10000 * (train_data['Close'] / train_data['Close'].iloc[0])
-    buy_hold_test  = 10000 * (test_data['Close']  / test_data['Close'].iloc[0])
+    acc_df = data.copy()
+    acc_df['RSI'] = compute_rsi(acc_df['Close'], acc_rsi_days)
+    acc_rsi = acc_df['RSI'].values
+    first_valid = int(np.argmax(~np.isnan(acc_rsi)))
+    acc_eval = acc_df.iloc[first_valid:]            # common period: from the first day with an RSI
+    rsi_eval = acc_rsi[first_valid:]
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), sharex=True, facecolor=DARK_BG)
-    fig.subplots_adjust(hspace=0.35)
+    thresholds = list(range(acc_th_range[0], acc_th_range[1] + 1))
+    res = [accumulation_result(acc_eval, rsi_eval, th, acc_include_cost) for th in thresholds]
+    grid = pd.DataFrame([{k: v for k, v in r_.items() if k not in ("idx", "outlays", "tau")} for r_ in res])
+    valid = grid[(grid['buys'] >= acc_min_buys) & grid['irr_cont'].notna()]
+    if valid.empty:
+        st.warning("No threshold gives enough purchases. Lower the minimum or widen the range.")
+        st.stop()
+    best_row = valid.loc[valid['irr_cont'].idxmax()]
+    best_th = int(best_row['threshold'])
+    best = res[thresholds.index(best_th)]
 
-    style_ax(ax1)
-    ax1.plot(train_df.index, train_df['Portfolio'], label="Strategy (Train)", color=BLUE, lw=1.8)
-    ax1.plot(test_df.index,  test_df['Portfolio'],  label="Strategy (Test)",  color=ORANGE, lw=1.8)
-    ax1.plot(train_data.index, buy_hold_train, '--', color='#93c5fd', lw=1.2, label="Buy & Hold (Train)")
-    ax1.plot(test_data.index,  buy_hold_test,  '--', color='#fdba74', lw=1.2, label="Buy & Hold (Test)")
-    ax1.axvline(train_data.index[-1], color=WHITE, lw=1, ls=':', alpha=0.7)
-    ax1.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=9)
-    ax1.set_title("Portfolio Value Comparison", color=WHITE, fontsize=12, fontweight='bold')
-    ax1.set_ylabel("Portfolio Value (₺)", color=TEXT_COLOR, fontsize=9)
+    # Benchmarks over the same period
+    C_eval = acc_eval['Close'].values
+    years_total = (acc_eval.index[-1] - acc_eval.index[0]).days / 365.25
+    cm = (1 + TRANSACTION_COST) if acc_include_cost else 1.0
+    bh_cont = np.log(C_eval[-1] / (C_eval[0] * cm)) / years_total
+    every_day = accumulation_result(acc_eval, np.zeros(len(acc_eval)), 1.0, acc_include_cost)  # RSI 0 < 1 always
+    ed_cont = every_day['irr_cont']
 
-    style_ax(ax2)
-    ax2.plot(data.index, data['Close'], color='#64748b', lw=1.2, label="Price")
-    all_signals = pd.concat([train_df, test_df])
-    ax2.scatter(all_signals[all_signals['Bottom']].index,
-                all_signals[all_signals['Bottom']]['Close'],
-                marker='^', color=GREEN, s=80, zorder=5, label="Buy Signal")
-    ax2.scatter(all_signals[all_signals['Peak']].index,
-                all_signals[all_signals['Peak']]['Close'],
-                marker='v', color=RED, s=80, zorder=5, label="Sell Signal")
-    ax2.axvline(train_data.index[-1], color=WHITE, lw=1, ls=':', alpha=0.7)
-    ax2.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=9)
-    ax2.set_title("Price Chart with Signals", color=WHITE, fontsize=12, fontweight='bold')
-    ax2.set_ylabel("Price", color=TEXT_COLOR, fontsize=9)
+    def pct_eff(r):
+        return f"{(np.exp(r) - 1) * 100:.2f}%" if np.isfinite(r) else "N/A"
 
-    fig.patch.set_facecolor(DARK_BG)
-    st.pyplot(fig)
-    plt.close(fig)
+    # ---- Headline ----
+    st.markdown("#### 🏆 Optimal Threshold")
+    a1, a2, a3, a4, a5, a6 = st.columns(6)
+    a1.metric("Buy when RSI below", best_th)
+    a2.metric("IRR (annual, effective)", pct_eff(best['irr_cont']),
+              delta=f"continuous r = {best['irr_cont']*100:.2f}%", delta_color="off")
+    a3.metric("Buy & Hold (annual)", pct_eff(bh_cont),
+              delta=f"{(best['irr_cont'] - bh_cont)*100:+.2f} pp (cont.)")
+    a4.metric("Buy every day (annual)", pct_eff(ed_cont),
+              delta=f"{(best['irr_cont'] - ed_cont)*100:+.2f} pp (cont.)")
+    a5.metric("Risk-free (annual)", f"{RISK_FREE_RATE_ANNUAL*100:.2f}%",
+              delta=f"{(best['irr_cont'] - rf_cont)*100:+.2f} pp (cont.)")
+    a6.metric("Shares accumulated", f"{best['buys']:,}")
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Total invested", f"{best['invested']:,.0f}")
+    b2.metric("Value at last close", f"{best['final_value']:,.0f}")
+    b3.metric("Profit", f"{best['profit']:,.0f}",
+              delta=f"{best['profit'] / best['invested'] * 100:.1f}% of invested", delta_color="off")
+    b4.metric("Average cost per share", f"{best['avg_price']:.2f}",
+              delta=f"last close {C_eval[-1]:.2f}", delta_color="off")
+    st.caption(f"Evaluation period {acc_eval.index[0].date()} → {acc_eval.index[-1].date()} "
+               f"({years_total:.2f} years; starts on the first day the RSI is available). "
+               "Effective annual rate = e^r − 1. Differences in pp are between continuous rates.")
 
-    st.subheader("Current Signal")
-    full_df, _, _, _ = backtest_strategy(data, *best_params, RISK_FREE_RATE_ANNUAL)
-    current_rsi = full_df['RSI'].iloc[-1]
-    is_bottom   = full_df['Bottom'].iloc[-1]
-    is_peak     = full_df['Peak'].iloc[-1]
-    last_price  = data['Close'].iloc[-1]
+    # ---- IRR vs threshold ----
+    figT, (axT1, axT2) = plt.subplots(1, 2, figsize=(16, 5), facecolor=DARK_BG)
+    style_ax(axT1, PANEL_BG2)
+    ok = grid['buys'] >= acc_min_buys
+    axT1.plot(grid['threshold'], (np.exp(grid['irr_cont']) - 1) * 100, color=GOLD, lw=1.0, alpha=0.4)
+    axT1.plot(grid.loc[ok, 'threshold'], (np.exp(grid.loc[ok, 'irr_cont']) - 1) * 100, 'o-', color=GOLD,
+              lw=1.8, ms=3, label="IRR of RSI accumulation")
+    axT1.axhline((np.exp(bh_cont) - 1) * 100, color='#94a3b8', ls='--', lw=1.2, label="Buy & Hold")
+    axT1.axhline((np.exp(ed_cont) - 1) * 100, color=CYAN, ls='-.', lw=1.2, label="Buy every day")
+    axT1.axhline(RISK_FREE_RATE_ANNUAL * 100, color=GREEN, ls=':', lw=1.4, label="Risk-free")
+    axT1.axvline(best_th, color=WHITE, ls=':', lw=1)
+    axT1.scatter([best_th], [(np.exp(best['irr_cont']) - 1) * 100], marker='*', s=220, color=WHITE,
+                 edgecolor='black', zorder=5, label=f"Optimum: RSI < {best_th}")
+    axT1.set_xlabel("RSI threshold (buy when RSI below)", color=TEXT_COLOR, fontsize=9)
+    axT1.set_ylabel("Annual return (%)", color=TEXT_COLOR, fontsize=9)
+    axT1.set_title("Internal Rate of Return vs RSI Threshold", color=WHITE, fontsize=11, fontweight='bold')
+    axT1.legend(facecolor=PANEL_BG2, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8)
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Last Close", f"{float(last_price):.2f}")
-    c2.metric("Current RSI", f"{float(current_rsi):.2f}")
-    if is_bottom:
-        c3.success(f"🟢 BUY SIGNAL")
-    elif is_peak:
-        c3.error(f"🔴 SELL SIGNAL")
+    style_ax(axT2, PANEL_BG2)
+    axT2.bar(grid['threshold'], grid['buys'], color=BLUE, alpha=0.6, label="Shares bought")
+    axT2.set_xlabel("RSI threshold", color=TEXT_COLOR, fontsize=9)
+    axT2.set_ylabel("Shares bought", color=TEXT_COLOR, fontsize=9)
+    axT2b = axT2.twinx()
+    axT2b.plot(grid['threshold'], grid['profit'], color=ORANGE, lw=1.8, label="Profit")
+    axT2b.tick_params(colors=TEXT_COLOR, labelsize=7)
+    axT2b.set_ylabel("Profit at last close", color=ORANGE, fontsize=8)
+    axT2.axvline(best_th, color=WHITE, ls=':', lw=1)
+    h1, l1 = axT2.get_legend_handles_labels(); h2, l2 = axT2b.get_legend_handles_labels()
+    axT2.legend(h1 + h2, l1 + l2, facecolor=PANEL_BG2, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8,
+                loc='upper left')
+    axT2.set_title("Size of the Plan: Shares Bought and Profit", color=WHITE, fontsize=11, fontweight='bold')
+    figT.patch.set_facecolor(DARK_BG)
+    st.pyplot(figT)
+    plt.close(figT)
+
+    # ---- Accumulation path, RSI and purchases ----
+    path = accumulation_path(acc_eval, best['idx'], best['outlays'], rf_cont)
+    buy_days = acc_eval.index[best['idx']]
+    figA = plt.figure(figsize=(16, 13), facecolor=DARK_BG)
+    gsA = gridspec.GridSpec(3, 1, height_ratios=[1.7, 1.3, 1.6], hspace=0.33)
+    axW = figA.add_subplot(gsA[0]); axR1 = figA.add_subplot(gsA[1], sharex=axW)
+    axS = figA.add_subplot(gsA[2], sharex=axW)
+
+    style_ax(axW)
+    axW.plot(path.index, path['Market value'], color=GOLD, lw=1.9, label="Market value of shares held")
+    axW.plot(path.index, path['Same cash at risk-free'], color=GREEN, lw=1.3, ls=':',
+             label="Same purchases invested at the risk-free rate")
+    axW.plot(path.index, path['Invested'], color='#94a3b8', lw=1.2, ls='--', label="Cumulative cash invested")
+    axW.set_ylabel("Value", color=TEXT_COLOR, fontsize=9)
+    axW.set_title(f"Accumulation Path — RSI < {best_th}: {best['buys']} shares, IRR {pct_eff(best['irr_cont'])} "
+                  f"per year", color=WHITE, fontsize=12, fontweight='bold')
+    axW.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8, loc='upper left')
+
+    style_ax(axR1)
+    axR1.plot(acc_eval.index, rsi_eval, color=BLUE, lw=1.1, label=f"RSI({acc_rsi_days})")
+    axR1.axhline(best_th, color=GREEN, ls='--', lw=1.0, label=f"Buy when RSI < {best_th}")
+    axR1.scatter(buy_days, acc_eval.loc[buy_days, 'RSI'], color=GREEN, s=14, zorder=5, label="Purchase day")
+    axR1.set_ylim(0, 100)
+    axR1.set_ylabel("RSI", color=TEXT_COLOR, fontsize=9)
+    axR1.set_title("RSI and Purchase Days", color=WHITE, fontsize=12, fontweight='bold')
+    axR1.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=7, loc='upper left', ncol=3)
+
+    style_ax(axS)
+    axS.plot(acc_eval.index, acc_eval['Close'], color='#cbd5e1', lw=1.1, label="Close")
+    axS.scatter(buy_days, acc_eval.loc[buy_days, 'Close'], marker='^', color=GREEN, s=26, zorder=5,
+                label="Buy 1 share")
+    axS.axhline(best['avg_price'], color=GOLD, ls='--', lw=1.0, label=f"Average cost {best['avg_price']:.2f}")
+    axS.set_ylabel("Price", color=TEXT_COLOR, fontsize=9)
+    axS.set_title(f"{TICKER} — Price and Purchases", color=WHITE, fontsize=12, fontweight='bold')
+    axS.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8, loc='upper left')
+    figA.patch.set_facecolor(DARK_BG)
+    st.pyplot(figA)
+    plt.close(figA)
+
+    # ---- Comparison table ----
+    st.markdown("#### 📊 Comparison")
+    comp = pd.DataFrame([
+        {"Plan": f"RSI < {best_th} accumulation (optimal)", "Shares": best['buys'],
+         "Invested": round(best['invested']), "Value at last close": round(best['final_value']),
+         "Annual return (continuous)": f"{best['irr_cont']*100:.2f}%", "Annual return (effective)": pct_eff(best['irr_cont'])},
+        {"Plan": "Buy one share every day", "Shares": every_day['buys'],
+         "Invested": round(every_day['invested']), "Value at last close": round(every_day['final_value']),
+         "Annual return (continuous)": f"{ed_cont*100:.2f}%", "Annual return (effective)": pct_eff(ed_cont)},
+        {"Plan": "Buy & hold (one share on the first day)", "Shares": 1,
+         "Invested": round(C_eval[0] * cm, 2), "Value at last close": round(C_eval[-1], 2),
+         "Annual return (continuous)": f"{bh_cont*100:.2f}%", "Annual return (effective)": pct_eff(bh_cont)},
+        {"Plan": "Risk-free rate", "Shares": "—", "Invested": "—", "Value at last close": "—",
+         "Annual return (continuous)": f"{rf_cont*100:.2f}%",
+         "Annual return (effective)": f"{RISK_FREE_RATE_ANNUAL*100:.2f}%"},
+    ])
+    st.dataframe(comp, use_container_width=True, hide_index=True)
+
+    # ---- All thresholds ----
+    with st.expander("📋 IRR for every threshold"):
+        gd = grid.copy()
+        gd['IRR (effective)'] = ((np.exp(gd['irr_cont']) - 1) * 100).round(2)
+        gd = gd[['threshold', 'buys', 'invested', 'final_value', 'profit', 'avg_price', 'IRR (effective)']].round(2)
+        gd.columns = ['Buy when RSI <', 'Shares', 'Invested', 'Value', 'Profit', 'Avg cost', 'IRR % p.a.']
+        gd['Valid'] = np.where(grid['buys'] >= acc_min_buys, "✓", "too few buys")
+        st.dataframe(gd, use_container_width=True, hide_index=True)
+
+    # ---- Current signal ----
+    st.markdown("#### 📍 Today")
+    cur_rsi = float(rsi_eval[-1])
+    t1c, t2c, t3c = st.columns(3)
+    t1c.metric("Last Close", f"{C_eval[-1]:.2f}")
+    t2c.metric("Current RSI", f"{cur_rsi:.1f}")
+    if cur_rsi < best_th:
+        t3c.success(f"🟢 BUY one share today — RSI {cur_rsi:.1f} < {best_th}")
     else:
-        c3.info("⚪ HOLD")
+        t3c.info(f"⚪ No purchase today — RSI {cur_rsi:.1f} ≥ {best_th}")
+
+    st.caption(
+        "Note: the IRR measures the return per unit invested, not the size of the plan. Very low thresholds "
+        "buy only a few shares near deep lows and can show a high IRR on a small amount; the right-hand chart "
+        "above shows how many shares each threshold buys. The threshold is chosen on the same data it is "
+        "evaluated on, so the optimal IRR is an in-sample figure.")
+
 
 # =====================================================
 # TAB 2 — Long / Short strategies
@@ -855,7 +1023,7 @@ with tab3:
         else:
             st.info("No trades generated.")
 
-st.caption("Developed for educational and research purposes — RSI Pivot + Long/Short + Heikin-Ashi Strategy Suite.")
+st.caption("Developed for educational and research purposes — RSI Accumulation + Long/Short + Heikin-Ashi Strategy Suite.")
 
 
 

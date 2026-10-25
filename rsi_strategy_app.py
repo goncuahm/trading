@@ -43,23 +43,27 @@ rsi_entry_short = st.sidebar.slider("Short Entry: RSI above", 50, 90, 67)
 max_holding_days = st.sidebar.slider("Max Holding Days", 5, 60, 22)
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🎯 RSI Delta Strategy (multi-entry)")
-rsi_days_d = st.sidebar.slider("RSI Period (Delta strategy)", 5, 30, 14)
-d_entry_range = st.sidebar.slider("Entry threshold search range (buy when RSI below)", 10, 45, (20, 35))
-d_delta_range = st.sidebar.slider("DELTA search range (sell when RSI rises by)", 5, 60, (15, 50))
-d_objective = st.sidebar.selectbox(
-    "Optimise for",
+st.sidebar.subheader("🎯 RSI + EMA Strategy (multi-entry)")
+rsi_days_e = st.sidebar.slider("RSI Period (RSI + EMA strategy)", 5, 30, 14)
+e_entry_range = st.sidebar.slider("Entry threshold search range (buy when RSI below)", 10, 50, (20, 35))
+e_ema_range = st.sidebar.slider("EMA period search range", 3, 60, (5, 30),
+                                help="Set both ends to the same value to fix the EMA period.")
+# EMA "green" = close at or above the EMA. (For an EMA this is the same as "EMA rising":
+# EMA_t - EMA_{t-1} = alpha * (Close_t - EMA_{t-1}), so the EMA rises exactly when the close is above it.)
+e_green_rule = "Close above EMA"
+e_objective = st.sidebar.selectbox(
+    "Optimise for (RSI + EMA)",
     ["Cumulative profit (sum over all trades)",
      "Average profit per trade",
      "Cumulative profit / max drawdown"],
     index=0)
-d_min_trades = st.sidebar.slider("Minimum closed trades for a valid setting", 1, 50, 5)
-d_position_size = st.sidebar.number_input("Capital per position (₺)", min_value=100, value=1000, step=100)
-d_execution = st.sidebar.selectbox(
-    "Execute trades at (Delta)",
+e_min_trades = st.sidebar.slider("Minimum closed trades for a valid setting (RSI + EMA)", 1, 50, 5)
+e_position_size = st.sidebar.number_input("Capital per position (₺)", min_value=100, value=1000, step=100)
+e_execution = st.sidebar.selectbox(
+    "Execute trades at (RSI + EMA)",
     ["Same day's close", "Next day's open (no look-ahead)"], index=0,
-    help="The signal uses the day's closing RSI. 'Same day's close' assumes you trade in the "
-         "closing auction; 'next open' avoids any look-ahead.")
+    help="Signals use the day's close. 'Same day's close' assumes you trade in the closing auction; "
+         "'next open' avoids any look-ahead.")
 
 # =====================================================
 # DOWNLOAD FUNCTION
@@ -367,38 +371,40 @@ def plot_equity_curve(ax, equity_curve, trade_df, color, label, title):
 
 
 # =====================================================
-# RSI DELTA STRATEGY — multiple entries / multiple exits
+# RSI + EMA STRATEGY — multiple entries, exit when EMA turns red
 # =====================================================
 
-def rsi_delta_exit_table(rsi_vals, deltas, max_entry):
-    """
-    For every day i with RSI[i] < max_entry, find for each DELTA the first day j > i
-    with RSI[j] >= RSI[i] + DELTA.  Returns an int array (n, len(deltas)); -1 = never reached.
-    Uses only RSI values after the entry day (the exit is the first time the target is hit).
-    """
-    n = len(rsi_vals)
-    deltas = np.asarray(deltas, dtype=float)
-    exit_idx = np.full((n, len(deltas)), -1, dtype=int)
-    for i in range(n - 1):
-        r = rsi_vals[i]
-        if np.isnan(r) or r >= max_entry:
-            continue
-        future = np.nan_to_num(rsi_vals[i + 1:], nan=-np.inf)
-        run_max = np.maximum.accumulate(future)            # non-decreasing
-        k = np.searchsorted(run_max, r + deltas, side='left')
-        hit = k < len(future)
-        exit_idx[i, hit] = i + 1 + k[hit]
-    return exit_idx
+def ema_green(close, ema_len, rule="Close above EMA"):
+    """Boolean array: True = EMA signal green on that day (uses data up to that day only)."""
+    ema = close.ewm(span=ema_len, adjust=False).mean()
+    if rule.startswith("EMA rising"):
+        green = (ema > ema.shift(1)).to_numpy(dtype=bool, copy=True)
+        green[0] = False
+    else:
+        green = (close >= ema).to_numpy(dtype=bool, copy=True)
+    return green, ema
 
 
-def rsi_delta_trades(df, rsi_vals, exit_col, entry_th, delta, execution="close"):
-    """Build the trade list for one (entry threshold, DELTA) setting."""
+def next_red_index(green):
+    """For every day i, the first day j > i on which the EMA signal is red (-1 if none)."""
+    n = len(green)
+    nxt = np.full(n, -1, dtype=int)
+    upcoming = -1
+    for i in range(n - 1, -1, -1):
+        nxt[i] = upcoming
+        if not green[i]:
+            upcoming = i
+    return nxt
+
+
+def rsi_ema_trades(df, rsi_vals, green, next_red, entry_th, execution="close"):
+    """One position per day with RSI < entry_th and EMA green; each closes on the next red day."""
     O = df['Open'].values; C = df['Close'].values; dates = df.index
     n = len(df)
-    entries = np.where((rsi_vals < entry_th) & ~np.isnan(rsi_vals))[0]
+    entries = np.where((rsi_vals < entry_th) & ~np.isnan(rsi_vals) & green)[0]
     rows = []
     for i in entries:
-        j = exit_col[i]
+        j = next_red[i]
         if execution == "close":
             e_i, e_px = i, C[i]
             closed = j >= 0
@@ -406,7 +412,7 @@ def rsi_delta_trades(df, rsi_vals, exit_col, entry_th, delta, execution="close")
             x_px = C[x_i]
         else:
             if i + 1 >= n:
-                continue                                    # no next open to buy at
+                continue
             e_i, e_px = i + 1, O[i + 1]
             closed = (j >= 0) and (j + 1 < n)
             x_i = j + 1 if closed else n - 1
@@ -415,8 +421,7 @@ def rsi_delta_trades(df, rsi_vals, exit_col, entry_th, delta, execution="close")
         net = (1 + gross) * (1 - TRANSACTION_COST) ** (2 if closed else 1) - 1
         rows.append({
             "entry_date": dates[e_i], "exit_date": dates[x_i],
-            "entry_rsi": rsi_vals[i], "target_rsi": rsi_vals[i] + delta,
-            "exit_rsi": rsi_vals[j] if j >= 0 else np.nan,
+            "entry_rsi": rsi_vals[i],
             "entry_price": e_px, "exit_price": x_px,
             "held_days": x_i - e_i, "gross_ret": gross, "net_ret": net,
             "status": "Closed" if closed else "Open (marked to market)",
@@ -425,12 +430,11 @@ def rsi_delta_trades(df, rsi_vals, exit_col, entry_th, delta, execution="close")
     return pd.DataFrame(rows)
 
 
-def rsi_delta_pnl_curve(df, trades, size):
+def multi_pnl_curve(df, trades, size):
     """
     Daily mark-to-market P&L (₺) of all positions and the number of open positions.
-    Open position (entry cost already paid): size * (C[t] * (1 - cost) / entry_price - 1).
-    Closed position: its realised net P&L from the exit day on.
-    Vectorised with difference arrays.
+    Open position (entry cost paid): size * (C[t] * (1 - cost) / entry_price - 1);
+    closed position: realised net P&L from its exit day on. Vectorised with difference arrays.
     """
     C = df['Close'].values; n = len(df)
     if trades is None or len(trades) == 0:
@@ -438,7 +442,7 @@ def rsi_delta_pnl_curve(df, trades, size):
         return z, z.astype(int)
     e = trades['_e'].values.astype(int); x = trades['_x'].values.astype(int)
     closed = (trades['status'] == "Closed").values
-    end = np.where(closed, x, n)                         # open interval [e, end)
+    end = np.where(closed, x, n)
     inv = 1.0 / trades['entry_price'].values
     d_inv = np.zeros(n + 1); d_cnt = np.zeros(n + 1); d_real = np.zeros(n + 1)
     np.add.at(d_inv, e, inv);  np.add.at(d_inv, end, -inv)
@@ -449,13 +453,13 @@ def rsi_delta_pnl_curve(df, trades, size):
     return pd.Series(pnl, index=df.index), pd.Series(cnt.astype(int), index=df.index)
 
 
-def rsi_delta_stats(trades, size):
+def multi_trade_stats(trades, size):
     if trades is None or len(trades) == 0:
         return dict(total=0.0, n=0, n_closed=0, n_open=0, avg=np.nan, avg_closed=np.nan,
                     win=np.nan, hold=np.nan)
     closed = trades[trades['status'] == "Closed"]
     return dict(
-        total=size * trades['net_ret'].sum(),               # realised + open marked to market
+        total=size * trades['net_ret'].sum(),
         n=len(trades), n_closed=len(closed), n_open=len(trades) - len(closed),
         avg=trades['net_ret'].mean(),
         avg_closed=closed['net_ret'].mean() if len(closed) else np.nan,
@@ -464,36 +468,35 @@ def rsi_delta_stats(trades, size):
     )
 
 
-def optimise_rsi_delta(df, rsi_len, entry_grid, delta_grid, execution, size, objective, min_closed):
+def optimise_rsi_ema(df, rsi_len, entry_grid, ema_grid, green_rule, execution, size, objective, min_closed):
     d = df.copy()
     d['RSI'] = compute_rsi(d['Close'], rsi_len)
     rsi_vals = d['RSI'].values
-    exit_tab = rsi_delta_exit_table(rsi_vals, delta_grid, max(entry_grid))
     rows = []
-    for a, E in enumerate(entry_grid):
-        for b, D in enumerate(delta_grid):
-            tr = rsi_delta_trades(d, rsi_vals, exit_tab[:, b], E, D, execution)
-            s = rsi_delta_stats(tr, size)
+    for L in ema_grid:
+        green, _ = ema_green(d['Close'], L, green_rule)
+        nxt = next_red_index(green)
+        for E in entry_grid:
+            tr = rsi_ema_trades(d, rsi_vals, green, nxt, E, execution)
+            s = multi_trade_stats(tr, size)
             if objective.startswith("Cumulative profit /") and s['n'] > 0:
-                pnl, _ = rsi_delta_pnl_curve(d, tr, size)
+                pnl, _ = multi_pnl_curve(d, tr, size)
                 mdd = (pnl - pnl.cummax()).min()
                 s['score'] = s['total'] / abs(mdd) if mdd < 0 else np.inf
-                s['mdd'] = mdd
             elif objective.startswith("Average"):
                 s['score'] = s['avg']
             else:
                 s['score'] = s['total']
             if s['n_closed'] < min_closed:
                 s['score'] = np.nan
-            rows.append({"Entry RSI <": E, "DELTA": D, **s})
-    grid = pd.DataFrame(rows)
-    return d, rsi_vals, exit_tab, grid
+            rows.append({"Entry RSI <": E, "EMA": L, **s})
+    return d, rsi_vals, pd.DataFrame(rows)
 
 
 @st.cache_data(show_spinner=False)
-def cached_optimise_rsi_delta(df, rsi_len, entry_grid, delta_grid, execution, size, objective, min_closed):
-    return optimise_rsi_delta(df, rsi_len, list(entry_grid), list(delta_grid),
-                              execution, size, objective, min_closed)
+def cached_optimise_rsi_ema(df, rsi_len, entry_grid, ema_grid, green_rule, execution, size, objective, min_closed):
+    return optimise_rsi_ema(df, rsi_len, list(entry_grid), list(ema_grid), green_rule,
+                            execution, size, objective, min_closed)
 
 
 def best_from_grid(grid):
@@ -507,7 +510,7 @@ def best_from_grid(grid):
 # MAIN APP
 # =====================================================
 
-st.title("📊 RSI Strategy Suite — Pivot Optimizer + Long/Short + RSI Delta")
+st.title("📊 RSI Strategy Suite — Pivot Optimizer + Long/Short + RSI/EMA")
 
 data = download_stock_data(TICKER, str(START), END)
 
@@ -521,7 +524,7 @@ st.success(f"Downloaded **{len(data)}** trading days for **{TICKER}**  |  {str(S
 # TAB LAYOUT
 # ─────────────────────────────────────────────
 tab1, tab2, tab3 = st.tabs(["🔁 RSI Pivot Strategy", "📈 Long / Short Strategies",
-                             "🎯 RSI Delta Strategy"])
+                             "🎯 RSI + EMA Strategy"])
 
 # =====================================================
 # TAB 1 — original RSI pivot strategy (unchanged)
@@ -739,58 +742,57 @@ with tab2:
         plt.close(fig3)
 
 # =====================================================
-# TAB 3 — RSI DELTA strategy (multiple entries / exits)
+# TAB 3 — RSI + EMA strategy (multiple entries, exit when EMA turns red)
 # =====================================================
 with tab3:
-    st.subheader("RSI Delta Strategy — Multiple Entries, Exit After an RSI Rise of DELTA")
+    st.subheader("RSI + EMA Strategy — Buy Oversold Days in a Green EMA, Exit When the EMA Turns Red")
 
-    exec_d = "open" if d_execution.startswith("Next") else "close"
-    entry_grid = tuple(range(d_entry_range[0], d_entry_range[1] + 1))
-    delta_grid = tuple(range(d_delta_range[0], d_delta_range[1] + 1))
+    exec_e = "open" if e_execution.startswith("Next") else "close"
+    entry_grid = tuple(range(e_entry_range[0], e_entry_range[1] + 1))
+    ema_grid = tuple(range(e_ema_range[0], e_ema_range[1] + 1))
+    green_txt = "close ≥ EMA (equivalently, the EMA is rising)"
 
     st.info(
-        f"**Rules** — RSI period **{rsi_days_d}**. On **every** day the RSI closes below the entry "
-        f"threshold **E**, a new position of **₺{d_position_size:,.0f}** is opened (positions can overlap: "
-        "if the RSI is 28 today and 20 tomorrow, both days open a position). Each position is closed on "
-        "the first later day its RSI reaches **its own entry RSI + DELTA** (entered at 20 with DELTA 25 → "
-        "sold when RSI ≥ 45). No stop-loss and no time limit; positions still open at the end are marked "
-        "to market.\n\n"
-        f"**Search** — E from {entry_grid[0]} to {entry_grid[-1]} and DELTA from {delta_grid[0]} to "
-        f"{delta_grid[-1]} ({len(entry_grid) * len(delta_grid)} settings), objective: **{d_objective}**, "
-        f"at least {d_min_trades} closed trades. Cost {TRANSACTION_COST*100:.1f}% per side; "
-        f"execution: {d_execution}."
+        f"**Rules** — RSI period **{rsi_days_e}**; EMA green = **{green_txt}**.\n\n"
+        f"**Buy:** on **every** day with RSI < **E** *and* the EMA green, open a new position of "
+        f"**₺{e_position_size:,.0f}** (positions can overlap).\n\n"
+        "**Sell:** close **all** open positions on the first day the EMA turns **red**. "
+        "No other exit; positions still open at the end are marked to market.\n\n"
+        f"**Search** — E from {entry_grid[0]} to {entry_grid[-1]} × EMA period from {ema_grid[0]} to "
+        f"{ema_grid[-1]} ({len(entry_grid) * len(ema_grid)} settings); objective: **{e_objective}**; "
+        f"at least {e_min_trades} closed trades. Cost {TRANSACTION_COST*100:.1f}% per side; "
+        f"execution: {e_execution}."
     )
 
-    with st.spinner(f"Searching {len(entry_grid) * len(delta_grid)} (E, DELTA) settings…"):
-        d_df, d_rsi, d_exit_tab, d_grid = cached_optimise_rsi_delta(
-            data, rsi_days_d, entry_grid, delta_grid, exec_d,
-            float(d_position_size), d_objective, d_min_trades)
+    with st.spinner(f"Searching {len(entry_grid) * len(ema_grid)} (E, EMA) settings…"):
+        e_df, e_rsi, e_grid = cached_optimise_rsi_ema(
+            data, rsi_days_e, entry_grid, ema_grid, e_green_rule, exec_e,
+            float(e_position_size), e_objective, e_min_trades)
 
-    best = best_from_grid(d_grid)
+    best = best_from_grid(e_grid)
     if best is None:
-        st.warning("No (E, DELTA) setting produced enough closed trades. "
+        st.warning("No (E, EMA) setting produced enough closed trades. "
                    "Lower the minimum number of trades or widen the ranges.")
         st.stop()
 
-    bE, bD = int(best['Entry RSI <']), int(best['DELTA'])
-    b_col = delta_grid.index(bD)
-    best_trades = rsi_delta_trades(d_df, d_rsi, d_exit_tab[:, b_col], bE, bD, exec_d)
-    pnl, n_open = rsi_delta_pnl_curve(d_df, best_trades, d_position_size)
-    bst = rsi_delta_stats(best_trades, d_position_size)
+    bE, bL = int(best['Entry RSI <']), int(best['EMA'])
+    b_green, b_ema = ema_green(e_df['Close'], bL, e_green_rule)
+    b_next = next_red_index(b_green)
+    best_trades = rsi_ema_trades(e_df, e_rsi, b_green, b_next, bE, exec_e)
+    pnl, n_open = multi_pnl_curve(e_df, best_trades, e_position_size)
+    bst = multi_trade_stats(best_trades, e_position_size)
     max_conc = int(n_open.max())
-    peak_cap = max_conc * d_position_size
+    peak_cap = max_conc * e_position_size
     mdd_try = float((pnl - pnl.cummax()).min())
-
-    # Buy & hold with the same peak capital, for comparison
-    bh_pnl = peak_cap * (d_df['Close'] / d_df['Close'].iloc[0] - 1)
+    bh_pnl = peak_cap * (e_df['Close'] / e_df['Close'].iloc[0] - 1)
 
     # ---- Optimal setting ----
     st.markdown("#### 🏆 Optimal Setting")
     o1, o2, o3, o4, o5, o6 = st.columns(6)
     o1.metric("Entry: RSI below", bE)
-    o2.metric("Exit: RSI rise DELTA", bD)
+    o2.metric("EMA period", bL)
     o3.metric("Cumulative profit", f"₺{bst['total']:,.0f}",
-              delta=f"{bst['total'] / d_position_size * 100:.0f}% of one position", delta_color="off")
+              delta=f"{bst['total'] / e_position_size * 100:.0f}% of one position", delta_color="off")
     o4.metric("Avg net profit / trade", f"{bst['avg']*100:.2f}%",
               delta=f"closed only: {bst['avg_closed']*100:.2f}%" if bst['n_closed'] else None,
               delta_color="off")
@@ -805,54 +807,55 @@ with tab3:
     p4.metric("Max drawdown of P&L", f"₺{mdd_try:,.0f}")
 
     # ---- Heatmaps over the search grid ----
-    st.markdown("#### 🗺️ Search Grid")
-    hm_total = d_grid.pivot(index='DELTA', columns='Entry RSI <', values='total')
-    hm_avg = d_grid.pivot(index='DELTA', columns='Entry RSI <', values='avg') * 100
-    hm_valid = d_grid.pivot(index='DELTA', columns='Entry RSI <', values='score').notna()
-    figH, (axH1, axH2) = plt.subplots(1, 2, figsize=(16, 6), facecolor=DARK_BG)
-    for axh, M, ttl, cmap, fmt in [
-            (axH1, hm_total, "Cumulative profit (₺)", 'RdYlGn', "₺{:,.0f}"),
-            (axH2, hm_avg, "Average net profit per trade (%)", 'RdYlGn', "{:.1f}%")]:
-        style_ax(axh, PANEL_BG2); axh.grid(False)
-        Mv = M.where(hm_valid)
-        lim = np.nanmax(np.abs(Mv.values)) if np.isfinite(np.nanmax(np.abs(Mv.values))) else 1
-        im = axh.imshow(Mv.values, aspect='auto', origin='lower', cmap=cmap, vmin=-lim, vmax=lim,
-                        extent=[M.columns[0] - 0.5, M.columns[-1] + 0.5, M.index[0] - 0.5, M.index[-1] + 0.5])
-        axh.scatter([bE], [bD], marker='*', s=260, color=WHITE, edgecolor='black', zorder=5,
-                    label=f"Optimum: E={bE}, Δ={bD}")
-        cb = figH.colorbar(im, ax=axh, fraction=0.046, pad=0.03)
-        cb.ax.tick_params(colors=TEXT_COLOR, labelsize=7)
-        axh.set_xlabel("Entry threshold E (buy when RSI < E)", color=TEXT_COLOR, fontsize=9)
-        axh.set_ylabel("DELTA (sell when RSI ≥ entry RSI + DELTA)", color=TEXT_COLOR, fontsize=9)
-        axh.set_title(ttl + "  —  grey = too few closed trades", color=WHITE, fontsize=11, fontweight='bold')
-        axh.set_facecolor('#475569')
-        axh.legend(facecolor=PANEL_BG2, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8, loc='upper left')
-    figH.patch.set_facecolor(DARK_BG)
-    st.pyplot(figH)
-    plt.close(figH)
+    if len(entry_grid) > 1 or len(ema_grid) > 1:
+        st.markdown("#### 🗺️ Search Grid")
+        hm_total = e_grid.pivot(index='EMA', columns='Entry RSI <', values='total')
+        hm_avg = e_grid.pivot(index='EMA', columns='Entry RSI <', values='avg') * 100
+        hm_valid = e_grid.pivot(index='EMA', columns='Entry RSI <', values='score').notna()
+        figH, (axH1, axH2) = plt.subplots(1, 2, figsize=(16, 6), facecolor=DARK_BG)
+        for axh, M, ttl in [(axH1, hm_total, "Cumulative profit (₺)"),
+                            (axH2, hm_avg, "Average net profit per trade (%)")]:
+            style_ax(axh, PANEL_BG2); axh.grid(False)
+            Mv = M.where(hm_valid)
+            mx = np.nanmax(np.abs(Mv.values)) if np.any(np.isfinite(Mv.values)) else 1.0
+            im = axh.imshow(Mv.values, aspect='auto', origin='lower', cmap='RdYlGn', vmin=-mx, vmax=mx,
+                            extent=[M.columns[0] - 0.5, M.columns[-1] + 0.5, M.index[0] - 0.5, M.index[-1] + 0.5])
+            axh.scatter([bE], [bL], marker='*', s=260, color=WHITE, edgecolor='black', zorder=5,
+                        label=f"Optimum: E={bE}, EMA={bL}")
+            cb = figH.colorbar(im, ax=axh, fraction=0.046, pad=0.03)
+            cb.ax.tick_params(colors=TEXT_COLOR, labelsize=7)
+            axh.set_xlabel("Entry threshold E (buy when RSI < E)", color=TEXT_COLOR, fontsize=9)
+            axh.set_ylabel("EMA period", color=TEXT_COLOR, fontsize=9)
+            axh.set_title(ttl + "  —  grey = too few closed trades", color=WHITE, fontsize=11, fontweight='bold')
+            axh.set_facecolor('#475569')
+            axh.legend(facecolor=PANEL_BG2, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8, loc='upper left')
+        figH.patch.set_facecolor(DARK_BG)
+        st.pyplot(figH)
+        plt.close(figH)
 
-    # ---- Main chart: P&L, RSI with entries / exits, price ----
-    closed_tr = best_trades[best_trades['status'] == "Closed"]
-    entry_days = d_df.index[np.where((d_rsi < bE) & ~np.isnan(d_rsi))[0]]
-    exit_days = pd.DatetimeIndex(sorted(set(d_df.index[np.array(
-        [j for j in d_exit_tab[:, b_col][(d_rsi < bE) & ~np.isnan(d_rsi)] if j >= 0], dtype=int)])))
+    # ---- Main chart: P&L, RSI with entries / exits, price with coloured EMA ----
+    entry_mask = (e_rsi < bE) & ~np.isnan(e_rsi) & b_green
+    entry_days = e_df.index[entry_mask]
+    exit_idx = np.unique([j for j in b_next[entry_mask] if j >= 0]).astype(int)
+    exit_days = e_df.index[exit_idx]
 
     fig6 = plt.figure(figsize=(16, 14), facecolor=DARK_BG)
-    gs6 = gridspec.GridSpec(3, 1, height_ratios=[1.9, 1.6, 1.9], hspace=0.34)
-    ax1d = fig6.add_subplot(gs6[0]); ax2d = fig6.add_subplot(gs6[1], sharex=ax1d)
-    ax3d = fig6.add_subplot(gs6[2], sharex=ax1d)
+    gs6 = gridspec.GridSpec(3, 1, height_ratios=[1.8, 1.5, 2.1], hspace=0.34)
+    ax1e = fig6.add_subplot(gs6[0]); ax2e = fig6.add_subplot(gs6[1], sharex=ax1e)
+    ax3e = fig6.add_subplot(gs6[2], sharex=ax1e)
 
-    style_ax(ax1d)
-    ax1d.plot(pnl.index, pnl.values, color=GOLD, lw=1.9, label=f"Strategy P&L, marked to market (E={bE}, Δ={bD})")
-    ax1d.plot(bh_pnl.index, bh_pnl.values, '--', color='#94a3b8', lw=1.2,
+    style_ax(ax1e)
+    ax1e.plot(pnl.index, pnl.values, color=GOLD, lw=1.9,
+              label=f"Strategy P&L, marked to market (E={bE}, EMA={bL})")
+    ax1e.plot(bh_pnl.index, bh_pnl.values, '--', color='#94a3b8', lw=1.2,
               label=f"Buy & Hold with peak capital ₺{peak_cap:,.0f}")
-    ax1d.axhline(0, color=GRID_COLOR, lw=0.8)
-    ax1d.set_ylabel("Cumulative P&L (₺)", color=TEXT_COLOR, fontsize=9)
-    ax1d.set_title(f"Complete Backtest {d_df.index[0].date()} → {d_df.index[-1].date()}  |  "
+    ax1e.axhline(0, color=GRID_COLOR, lw=0.8)
+    ax1e.set_ylabel("Cumulative P&L (₺)", color=TEXT_COLOR, fontsize=9)
+    ax1e.set_title(f"Complete Backtest {e_df.index[0].date()} → {e_df.index[-1].date()}  |  "
                    f"Cumulative profit ₺{bst['total']:,.0f}  ·  {bst['n']} trades",
                    color=WHITE, fontsize=12, fontweight='bold')
-    ax1d.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8, loc='upper left')
-    ax1n = ax1d.twinx()
+    ax1e.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8, loc='upper left')
+    ax1n = ax1e.twinx()
     ax1n.fill_between(n_open.index, n_open.values, 0, step='post', color=CYAN, alpha=0.15)
     ax1n.set_ylim(0, max(max_conc * 3, 1))
     ax1n.tick_params(colors=TEXT_COLOR, labelsize=7)
@@ -860,131 +863,121 @@ with tab3:
     for spine in ax1n.spines.values():
         spine.set_color(GRID_COLOR)
 
-    style_ax(ax2d)
-    ax2d.plot(d_df.index, d_rsi, color=BLUE, lw=1.1, label=f"RSI({rsi_days_d})")
-    ax2d.axhline(bE, color=GREEN, ls='--', lw=1.0, label=f"Entry: RSI < {bE}")
-    ax2d.scatter(entry_days, d_df.loc[entry_days, 'RSI'], color=GREEN, s=18, zorder=5,
-                 label="Entry day (new position)")
-    ax2d.scatter(exit_days, d_df.loc[exit_days, 'RSI'], color=RED, s=22, marker='v', zorder=5,
-                 label=f"Exit day (RSI ≥ entry RSI + {bD})")
-    last_rsi_d = float(d_rsi[-1])
-    ax2d.annotate(f"RSI {last_rsi_d:.1f}", xy=(d_df.index[-1], last_rsi_d), xytext=(8, 8),
+    style_ax(ax2e)
+    ax2e.plot(e_df.index, e_rsi, color=BLUE, lw=1.1, label=f"RSI({rsi_days_e})")
+    ax2e.axhline(bE, color=GREEN, ls='--', lw=1.0, label=f"Entry: RSI < {bE}")
+    ax2e.scatter(entry_days, e_df.loc[entry_days, 'RSI'], color=GREEN, s=22, zorder=5,
+                 label="Entry day (RSI < E and EMA green)")
+    ax2e.scatter(exit_days, e_df.loc[exit_days, 'RSI'], color=RED, s=26, marker='v', zorder=5,
+                 label="Exit day (EMA turns red)")
+    last_rsi_e = float(e_rsi[-1])
+    ax2e.annotate(f"RSI {last_rsi_e:.1f}", xy=(e_df.index[-1], last_rsi_e), xytext=(8, 8),
                   textcoords='offset points', color=BLUE, fontsize=8, fontweight='bold')
-    ax2d.set_ylim(0, 100)
-    ax2d.set_ylabel("RSI", color=TEXT_COLOR, fontsize=9)
-    ax2d.set_title("RSI with Entries and Exits", color=WHITE, fontsize=12, fontweight='bold')
-    ax2d.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=7, loc='upper left', ncol=4)
+    ax2e.set_ylim(0, 100)
+    ax2e.set_ylabel("RSI", color=TEXT_COLOR, fontsize=9)
+    ax2e.set_title("RSI with Entries and Exits", color=WHITE, fontsize=12, fontweight='bold')
+    ax2e.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=7, loc='upper left', ncol=4)
 
-    style_ax(ax3d)
-    ax3d.plot(d_df.index, d_df['Close'], color='#cbd5e1', lw=1.2, label="Close")
-    ax3d.scatter(entry_days, d_df.loc[entry_days, 'Close'], marker='^', color=GREEN, s=40, zorder=5, label="Buy")
-    ax3d.scatter(exit_days, d_df.loc[exit_days, 'Close'], marker='v', color=RED, s=50, zorder=5, label="Sell")
-    ax3d.set_title(f"{TICKER} — Price with Buy / Sell Days", color=WHITE, fontsize=12, fontweight='bold')
-    ax3d.set_ylabel("Price", color=TEXT_COLOR, fontsize=9)
-    ax3d.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8, loc='upper left')
+    style_ax(ax3e)
+    ax3e.plot(e_df.index, e_df['Close'], color='#cbd5e1', lw=1.1, label="Close")
+    ema_g = b_ema.where(b_green); ema_r = b_ema.where(~b_green)
+    ax3e.plot(e_df.index, ema_g, color=GREEN, lw=1.8, label=f"EMA({bL}) green")
+    ax3e.plot(e_df.index, ema_r, color=RED, lw=1.8, label=f"EMA({bL}) red")
+    ax3e.scatter(entry_days, e_df.loc[entry_days, 'Close'], marker='^', color=GREEN, s=55, zorder=5,
+                 edgecolor='white', linewidth=0.5, label="Buy")
+    ax3e.scatter(exit_days, e_df.loc[exit_days, 'Close'], marker='v', color=RED, s=60, zorder=5,
+                 edgecolor='white', linewidth=0.5, label="Sell (all open positions)")
+    ax3e.set_title(f"{TICKER} — Price, EMA({bL}) Colour and Buy / Sell Days",
+                   color=WHITE, fontsize=12, fontweight='bold')
+    ax3e.set_ylabel("Price", color=TEXT_COLOR, fontsize=9)
+    ax3e.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8, loc='upper left', ncol=3)
     fig6.patch.set_facecolor(DARK_BG)
     st.pyplot(fig6)
     plt.close(fig6)
 
     # ---- Current state ----
     st.markdown("#### 📍 Current State")
-    c1d, c2d, c3d = st.columns(3)
-    c1d.metric("Last Close", f"{float(d_df['Close'].iloc[-1]):.2f}")
-    c2d.metric("Current RSI", f"{last_rsi_d:.1f}")
-    if last_rsi_d < bE:
-        c3d.success(f"🟢 BUY today — RSI {last_rsi_d:.1f} < {bE}; target RSI {last_rsi_d + bD:.1f}")
+    is_green_now = bool(b_green[-1])
+    c1e, c2e, c3e, c4e = st.columns(4)
+    c1e.metric("Last Close", f"{float(e_df['Close'].iloc[-1]):.2f}")
+    c2e.metric("Current RSI", f"{last_rsi_e:.1f}")
+    c3e.metric(f"EMA({bL})", f"{float(b_ema.iloc[-1]):.2f}", delta="🟢 green" if is_green_now else "🔴 red",
+               delta_color="off")
+    if last_rsi_e < bE and is_green_now:
+        c4e.success(f"🟢 BUY today — RSI {last_rsi_e:.1f} < {bE} and EMA green")
+    elif not is_green_now:
+        c4e.error("🔴 EMA red — no entries; any open positions are sold")
     else:
-        c3d.info(f"⚪ No new entry — RSI {last_rsi_d:.1f} ≥ {bE}")
-    open_pos = best_trades[best_trades['status'] != "Closed"]
+        c4e.info(f"⚪ EMA green, RSI {last_rsi_e:.1f} ≥ {bE} — hold open positions, no new entry")
+    open_pos = best_trades[best_trades['status'] != "Closed"] if len(best_trades) else best_trades
     if len(open_pos):
-        op = open_pos[['entry_date', 'entry_price', 'entry_rsi', 'target_rsi', 'held_days', 'net_ret']].copy()
-        op['entry_price'] = op['entry_price'].round(2)
-        op['entry_rsi'] = op['entry_rsi'].round(1); op['target_rsi'] = op['target_rsi'].round(1)
+        op = open_pos[['entry_date', 'entry_price', 'entry_rsi', 'held_days', 'net_ret']].copy()
+        op['entry_price'] = op['entry_price'].round(2); op['entry_rsi'] = op['entry_rsi'].round(1)
         op['net_ret'] = (op['net_ret'] * 100).round(2).astype(str) + '%'
-        op.columns = ['Entry', 'Entry Px', 'Entry RSI', 'Sell when RSI ≥', 'Days open', 'Unrealised %']
-        st.markdown(f"**{len(op)} open position(s)** waiting for their RSI target:")
+        op.columns = ['Entry', 'Entry Px', 'Entry RSI', 'Days open', 'Unrealised %']
+        st.markdown(f"**{len(op)} open position(s)** — all will be sold when the EMA turns red:")
         st.dataframe(op, use_container_width=True, hide_index=True)
     else:
         st.caption("No open positions.")
 
     # ---- Trade log ----
-    with st.expander(f"📋 Trade Log — E={bE}, DELTA={bD}  ({len(best_trades)} trades)"):
-        tl = best_trades[['entry_date', 'exit_date', 'entry_rsi', 'target_rsi', 'exit_rsi',
-                          'entry_price', 'exit_price', 'held_days', 'net_ret', 'status']].copy()
-        for c in ['entry_rsi', 'target_rsi', 'exit_rsi']:
-            tl[c] = tl[c].round(1)
-        tl['entry_price'] = tl['entry_price'].round(2); tl['exit_price'] = tl['exit_price'].round(2)
-        tl['net_ret'] = (tl['net_ret'] * 100).round(2)
-        tl.columns = ['Entry', 'Exit', 'Entry RSI', 'Target RSI', 'Exit RSI',
-                      'Entry Px', 'Exit Px', 'Days', 'Net Ret %', 'Status']
-        st.dataframe(tl, use_container_width=True, hide_index=True)
-        st.download_button("⬇️ Download trade log (CSV)", tl.to_csv(index=False).encode("utf-8"),
-                           file_name=f"{TICKER}_rsi_delta_trades.csv", mime="text/csv")
+    with st.expander(f"📋 Trade Log — E={bE}, EMA={bL}  ({len(best_trades)} trades)"):
+        if len(best_trades):
+            tl = best_trades[['entry_date', 'exit_date', 'entry_rsi', 'entry_price', 'exit_price',
+                              'held_days', 'net_ret', 'status']].copy()
+            tl['entry_rsi'] = tl['entry_rsi'].round(1)
+            tl['entry_price'] = tl['entry_price'].round(2); tl['exit_price'] = tl['exit_price'].round(2)
+            tl['net_ret'] = (tl['net_ret'] * 100).round(2)
+            tl.columns = ['Entry', 'Exit', 'Entry RSI', 'Entry Px', 'Exit Px', 'Days', 'Net Ret %', 'Status']
+            st.dataframe(tl, use_container_width=True, hide_index=True)
+            st.download_button("⬇️ Download trade log (CSV)", tl.to_csv(index=False).encode("utf-8"),
+                               file_name=f"{TICKER}_rsi_ema_trades.csv", mime="text/csv")
+        else:
+            st.info("No trades generated.")
 
     # ---- Top settings ----
     st.markdown("#### 📊 Top 10 Settings")
-    top = d_grid.dropna(subset=['score']).sort_values(['score', 'total'], ascending=False).head(10).copy()
-    top_disp = pd.DataFrame({
-        "Entry RSI <": top['Entry RSI <'], "DELTA": top['DELTA'],
+    top = e_grid.dropna(subset=['score']).sort_values(['score', 'total'], ascending=False).head(10)
+    st.dataframe(pd.DataFrame({
+        "Entry RSI <": top['Entry RSI <'], "EMA": top['EMA'],
         "Cumulative profit (₺)": top['total'].round(0),
         "Avg net / trade": (top['avg'] * 100).round(2).astype(str) + '%',
         "Closed": top['n_closed'], "Open": top['n_open'],
         "Win rate": (top['win'] * 100).round(0).astype(str) + '%',
         "Avg hold (days)": top['hold'].round(1),
-    })
-    st.dataframe(top_disp, use_container_width=True, hide_index=True)
-
-    # ---- Profit vs DELTA at the optimal entry threshold ----
-    st.markdown(f"#### 📈 Profit vs DELTA at Entry RSI < {bE}")
-    sl = d_grid[d_grid['Entry RSI <'] == bE]
-    figD, axD = plt.subplots(figsize=(14, 4), facecolor=DARK_BG)
-    style_ax(axD, PANEL_BG2)
-    axD.bar(sl['DELTA'], sl['total'], color=np.where(sl['total'] >= 0, GREEN, RED), alpha=0.75,
-            label="Cumulative profit (₺)")
-    axD.set_xlabel("DELTA", color=TEXT_COLOR, fontsize=9)
-    axD.set_ylabel("Cumulative profit (₺)", color=TEXT_COLOR, fontsize=9)
-    axD2 = axD.twinx()
-    axD2.plot(sl['DELTA'], sl['avg'] * 100, color=GOLD, lw=1.8, marker='o', ms=3, label="Avg net / trade (%)")
-    axD2.tick_params(colors=TEXT_COLOR, labelsize=7)
-    axD2.set_ylabel("Avg net profit per trade (%)", color=GOLD, fontsize=8)
-    axD.axvline(bD, color=WHITE, ls=':', lw=1)
-    h1, l1 = axD.get_legend_handles_labels(); h2, l2 = axD2.get_legend_handles_labels()
-    axD.legend(h1 + h2, l1 + l2, facecolor=PANEL_BG2, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8,
-               loc='upper left')
-    figD.patch.set_facecolor(DARK_BG)
-    st.pyplot(figD)
-    plt.close(figD)
+    }), use_container_width=True, hide_index=True)
 
     # ---- Optional hold-out check ----
     st.markdown("#### 🧪 Hold-out Check (optional)")
     st.caption(
-        "The optimum above is chosen on the same data it is evaluated on, so its profit is optimistic: "
-        f"it is the best of {len(entry_grid) * len(delta_grid)} settings. This check chooses (E, DELTA) "
-        "on the first 75% of the period only and then applies it, unchanged, to the last 25%.")
-    if st.checkbox("Run hold-out check", value=False, key="d_holdout"):
+        f"The optimum above is the best of {len(entry_grid) * len(ema_grid)} settings on the same data, "
+        "so its profit is optimistic. This check chooses (E, EMA) on the first 75% of the period only "
+        "and applies it, unchanged, to the last 25%.")
+    if st.checkbox("Run hold-out check", value=False, key="e_holdout"):
         split = int(len(data) * 0.75)
         with st.spinner("Optimising on the first 75%…"):
-            tr_df, tr_rsi, tr_exit, tr_grid = cached_optimise_rsi_delta(
-                data.iloc[:split], rsi_days_d, entry_grid, delta_grid, exec_d,
-                float(d_position_size), d_objective, d_min_trades)
+            _, _, tr_grid = cached_optimise_rsi_ema(
+                data.iloc[:split], rsi_days_e, entry_grid, ema_grid, e_green_rule, exec_e,
+                float(e_position_size), e_objective, e_min_trades)
         tb = best_from_grid(tr_grid)
         if tb is None:
             st.warning("Not enough trades in the first 75% to choose a setting.")
         else:
-            tE, tD = int(tb['Entry RSI <']), int(tb['DELTA'])
-            full_tr = rsi_delta_trades(d_df, d_rsi, d_exit_tab[:, delta_grid.index(tD)], tE, tD, exec_d)
+            tE, tL = int(tb['Entry RSI <']), int(tb['EMA'])
+            g_t, _ = ema_green(e_df['Close'], tL, e_green_rule)
+            full_tr = rsi_ema_trades(e_df, e_rsi, g_t, next_red_index(g_t), tE, exec_e)
             split_date = data.index[split]
-            test_tr = full_tr[full_tr['entry_date'] >= split_date]
-            ts = rsi_delta_stats(test_tr, d_position_size)
+            test_tr = full_tr[full_tr['entry_date'] >= split_date] if len(full_tr) else full_tr
+            ts = multi_trade_stats(test_tr, e_position_size)
             h1c, h2c, h3c, h4c = st.columns(4)
-            h1c.metric("Chosen on first 75%", f"E={tE}, Δ={tD}")
+            h1c.metric("Chosen on first 75%", f"E={tE}, EMA={tL}")
             h2c.metric("Hold-out cumulative profit", f"₺{ts['total']:,.0f}")
             h3c.metric("Hold-out avg / trade", f"{ts['avg']*100:.2f}%" if ts['n'] else "N/A")
             h4c.metric("Hold-out trades (closed / open)", f"{ts['n_closed']} / {ts['n_open']}")
             st.caption(f"Hold-out period: {split_date.date()} → {data.index[-1].date()}. "
                        "Trades entered in the hold-out period are counted; exits use the full price path.")
 
-st.caption("Developed for educational and research purposes — RSI Pivot + Long/Short + RSI Delta Strategy Suite.")
+st.caption("Developed for educational and research purposes — RSI Pivot + Long/Short + RSI/EMA Strategy Suite.")
 
 
 

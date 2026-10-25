@@ -42,6 +42,25 @@ rsi_entry_long = st.sidebar.slider("Long Entry: RSI below", 10, 50, 33)
 rsi_entry_short = st.sidebar.slider("Short Entry: RSI above", 50, 90, 67)
 max_holding_days = st.sidebar.slider("Max Holding Days", 5, 60, 22)
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("🧮 RSI + Cubic Forecast Strategy")
+rsi_days_cf = st.sidebar.slider(
+    "RSI Period (also the cubic-fit window)", 5, 30, 14,
+    help="The RSI is computed over this many days, and the cubic polynomial is fitted "
+         "to the last this-many RSI values.")
+cf_oversold = st.sidebar.slider("Oversold: RSI below", 10, 45, 30)
+cf_overbought = st.sidebar.slider("Overbought: RSI above", 55, 90, 70)
+cf_horizon = st.sidebar.slider(
+    "Forecast horizon (days ahead)", 1, 5, 1,
+    help="The cubic fit is extrapolated this many days ahead. 'Turning up' means the "
+         "forecast RSI is above today's RSI; 'turning down' means it is below.")
+cf_execution = st.sidebar.selectbox(
+    "Execute trades at",
+    ["Next day's open (no look-ahead)", "Same day's close"],
+    index=0,
+    help="The signal uses today's close. Trading at the next open avoids look-ahead; "
+         "trading at today's close assumes you can act in the closing auction.")
+
 # =====================================================
 # DOWNLOAD FUNCTION
 # =====================================================
@@ -348,10 +367,195 @@ def plot_equity_curve(ax, equity_curve, trade_df, color, label, title):
 
 
 # =====================================================
+# RSI + CUBIC POLYNOMIAL FORECAST STRATEGY
+# =====================================================
+
+def cubic_rsi_forecast(rsi, window, horizon=1):
+    """
+    For every day t, fit a cubic polynomial to the last `window` RSI values
+    (RSI[t-window+1] ... RSI[t]) and extrapolate it `horizon` days ahead.
+    Uses only data up to day t (no look-ahead).
+
+    Returns
+    -------
+    forecast : np.ndarray  forecast of RSI[t+horizon] made on day t (NaN where unavailable)
+    coefs    : np.ndarray  (len, 4) cubic coefficients on the scaled x-axis
+    x_mean, x_std : scaling used for the x-axis (for plotting the fitted curve)
+    """
+    vals = np.asarray(rsi, dtype=float)
+    n = len(vals)
+    forecast = np.full(n, np.nan)
+    coefs = np.full((n, 4), np.nan)
+    if n < window:
+        return forecast, coefs, 0.0, 1.0
+
+    x = np.arange(window, dtype=float)
+    x_mean, x_std = x.mean(), x.std()
+    xs = (x - x_mean) / x_std                       # scaled for numerical stability
+    X = np.vander(xs, 4)                            # columns: x^3, x^2, x, 1
+    P = np.linalg.pinv(X)                           # least-squares solver, same for every window
+    xf = (window - 1 + horizon - x_mean) / x_std
+    vf = np.array([xf ** 3, xf ** 2, xf, 1.0])
+
+    W = np.lib.stride_tricks.sliding_window_view(vals, window)   # window ending at t = j + window - 1
+    C = W @ P.T                                     # (n - window + 1, 4); NaN if the window has NaN
+    coefs[window - 1:] = C
+    forecast[window - 1:] = C @ vf
+    return forecast, coefs, x_mean, x_std
+
+
+def cubic_rsi_signals(df, rsi_len, oversold, overbought, horizon, use_forecast=True):
+    """
+    State machine on daily closes.
+
+    Flat:  RSI < oversold          -> buy setup is ARMED
+           armed and forecast up   -> BUY  (forecast RSI[t+h] > RSI[t])
+           RSI > overbought        -> setup cancelled (never bought)
+    Long:  RSI > overbought        -> sell setup is ARMED
+           armed and forecast down -> SELL (forecast RSI[t+h] < RSI[t])
+
+    With use_forecast=False the cubic filter is switched off (baseline):
+    buy as soon as RSI < oversold, sell as soon as RSI > overbought.
+    """
+    df = df.copy()
+    df['RSI'] = compute_rsi(df['Close'], rsi_len)
+    fc, coefs, x_mean, x_std = cubic_rsi_forecast(df['RSI'].values, rsi_len, horizon)
+    df['RSI_fc'] = fc
+
+    rsi_v = df['RSI'].values
+    n = len(df)
+    pos = np.zeros(n, dtype=int)          # desired position after the close of day t
+    buy = np.zeros(n, dtype=bool)
+    sell = np.zeros(n, dtype=bool)
+    armed_buy_arr = np.zeros(n, dtype=bool)
+    armed_sell_arr = np.zeros(n, dtype=bool)
+
+    in_pos, armed_buy, armed_sell = False, False, False
+    for t in range(n):
+        r, f = rsi_v[t], fc[t]
+        if np.isnan(r) or (use_forecast and np.isnan(f)):
+            pos[t] = int(in_pos)
+            continue
+        up = (f > r) if use_forecast else True
+        down = (f < r) if use_forecast else True
+        if not in_pos:
+            if r < oversold:
+                armed_buy = True
+            elif r > overbought:
+                armed_buy = False
+            if armed_buy and up:
+                buy[t], in_pos, armed_buy, armed_sell = True, True, False, False
+        else:
+            if r > overbought:
+                armed_sell = True
+            if armed_sell and down:
+                sell[t], in_pos, armed_sell = True, False, False
+        pos[t] = int(in_pos)
+        armed_buy_arr[t], armed_sell_arr[t] = armed_buy, armed_sell
+
+    df['Position'] = pos
+    df['BuySig'] = buy
+    df['SellSig'] = sell
+    df['ArmedBuy'] = armed_buy_arr
+    df['ArmedSell'] = armed_sell_arr
+    return df, coefs, x_mean, x_std
+
+
+def backtest_cubic(df_sig, risk_free_rate, execution="open"):
+    """
+    Daily backtest of the position series. 100% invested when long; cash earns the
+    risk-free rate when flat; TRANSACTION_COST per side.
+    execution='open'  : signal at close t, trade at the open of t+1.
+    execution='close' : signal at close t, trade at the close of t.
+    Returns (daily equity Series, daily strategy returns, trade DataFrame).
+    """
+    O = df_sig['Open'].values; C = df_sig['Close'].values
+    sig = df_sig['Position'].values
+    dates = df_sig.index
+    n = len(df_sig)
+    daily_rf = (1 + risk_free_rate) ** (1 / 252) - 1
+
+    rets = np.zeros(n)
+    trades, entry = [], None
+    for d in range(1, n):
+        if execution == "close":
+            p_new = sig[d - 1]
+            p_old = sig[d - 2] if d >= 2 else 0
+            r = p_new * (C[d] / C[d - 1] - 1) + (1 - p_new) * daily_rf
+            if p_new != p_old:                       # traded at the close of d-1
+                r = (1 + r) * (1 - TRANSACTION_COST) - 1
+                trade_date, trade_px = dates[d - 1], C[d - 1]
+        else:
+            p_old = sig[d - 2] if d >= 2 else 0       # held overnight into d
+            p_new = sig[d - 1]                        # held from the open of d
+            overnight = p_old * (O[d] / C[d - 1] - 1)
+            intraday = p_new * (C[d] / O[d] - 1)
+            r = (1 + overnight) * (1 + intraday) - 1 + (1 - p_new) * daily_rf
+            if p_new != p_old:
+                r = (1 + r) * (1 - TRANSACTION_COST) - 1
+                trade_date, trade_px = dates[d], O[d]
+        rets[d] = r
+
+        if p_new != p_old:
+            if p_new == 1:
+                entry = (trade_date, trade_px, d)
+            elif entry is not None:
+                gross = trade_px / entry[1] - 1
+                trades.append({
+                    "entry_date": entry[0], "exit_date": trade_date,
+                    "entry_price": entry[1], "exit_price": trade_px,
+                    "held_days": d - entry[2],
+                    "gross_ret": gross,
+                    "net_ret": (1 + gross) * (1 - TRANSACTION_COST) ** 2 - 1,
+                    "exit_reason": "Overbought + turn down",
+                })
+                entry = None
+
+    if entry is not None:                             # open position, marked to market
+        gross = C[-1] / entry[1] - 1
+        trades.append({
+            "entry_date": entry[0], "exit_date": dates[-1],
+            "entry_price": entry[1], "exit_price": C[-1],
+            "held_days": n - 1 - entry[2],
+            "gross_ret": gross,
+            "net_ret": (1 + gross) * (1 - TRANSACTION_COST) - 1,
+            "exit_reason": "Open (marked to market)",
+        })
+
+    equity = pd.Series(np.cumprod(1 + rets), index=dates)
+    return equity, pd.Series(rets, index=dates), pd.DataFrame(trades)
+
+
+def cubic_performance(equity, rets, trade_df, df_sig, risk_free_rate, label):
+    n_years = max(len(equity) / 252, 1e-9)
+    daily_rf = (1 + risk_free_rate) ** (1 / 252) - 1
+    total = equity.iloc[-1] - 1
+    cagr = equity.iloc[-1] ** (1 / n_years) - 1
+    xs = rets.iloc[1:] - daily_rf
+    sharpe = np.sqrt(252) * xs.mean() / xs.std() if xs.std() > 0 else np.nan
+    max_dd = (equity / equity.cummax() - 1).min()
+    calmar = cagr / abs(max_dd) if max_dd < 0 else np.nan
+    closed = trade_df[trade_df['exit_reason'] != "Open (marked to market)"] if len(trade_df) else trade_df
+    return {
+        "Strategy": label,
+        "Total Return": f"{total*100:.1f}%",
+        "CAGR": f"{cagr*100:.1f}%",
+        "Sharpe (excess of rf)": f"{sharpe:.2f}" if not np.isnan(sharpe) else "N/A",
+        "Max Drawdown": f"{max_dd*100:.1f}%",
+        "Calmar (CAGR/MaxDD)": f"{calmar:.2f}" if not np.isnan(calmar) else "N/A",
+        "Time in Market": f"{df_sig['Position'].mean()*100:.0f}%" if 'Position' in df_sig else "100%",
+        "Trades": len(closed) if len(trade_df) else 0,
+        "Win Rate": f"{(closed['net_ret'] > 0).mean()*100:.0f}%" if len(closed) else "N/A",
+        "Avg Net Ret/Trade": f"{closed['net_ret'].mean()*100:.2f}%" if len(closed) else "N/A",
+        "Avg Hold (days)": f"{closed['held_days'].mean():.1f}" if len(closed) else "N/A",
+    }
+
+
+# =====================================================
 # MAIN APP
 # =====================================================
 
-st.title("📊 RSI Strategy Suite — Pivot Optimizer + Long/Short")
+st.title("📊 RSI Strategy Suite — Pivot Optimizer + Long/Short + Cubic Forecast")
 
 data = download_stock_data(TICKER, str(START), END)
 
@@ -364,7 +568,8 @@ st.success(f"Downloaded **{len(data)}** trading days for **{TICKER}**  |  {str(S
 # ─────────────────────────────────────────────
 # TAB LAYOUT
 # ─────────────────────────────────────────────
-tab1, tab2 = st.tabs(["🔁 RSI Pivot Strategy", "📈 Long / Short Strategies"])
+tab1, tab2, tab3 = st.tabs(["🔁 RSI Pivot Strategy", "📈 Long / Short Strategies",
+                             "🧮 RSI + Cubic Forecast"])
 
 # =====================================================
 # TAB 1 — original RSI pivot strategy (unchanged)
@@ -581,7 +786,200 @@ with tab2:
         st.pyplot(fig3)
         plt.close(fig3)
 
-st.caption("Developed for educational and research purposes — RSI Pivot + Long/Short Strategy Suite.")
+# =====================================================
+# TAB 3 — RSI + cubic polynomial forecast strategy
+# =====================================================
+with tab3:
+    st.subheader("RSI Oversold / Overbought with Cubic-Polynomial Turn Confirmation")
+
+    exec_mode = "open" if cf_execution.startswith("Next") else "close"
+    st.info(
+        f"**Rules (from sidebar)** — RSI period = cubic window = **{rsi_days_cf}** days  |  "
+        f"Forecast horizon = **{cf_horizon}** day(s)  |  Execution: **{cf_execution}**\n\n"
+        f"**BUY:** RSI falls below **{cf_oversold}** (oversold, setup armed) → buy on the first day the "
+        f"cubic fit of the last {rsi_days_cf} RSI values forecasts the RSI to **rise** "
+        f"(forecast RSI in {cf_horizon} day(s) > today's RSI).\n\n"
+        f"**SELL:** while long, RSI rises above **{cf_overbought}** (overbought, exit armed) → sell on the "
+        f"first day the cubic fit forecasts the RSI to **fall**. The position is held until then.\n\n"
+        f"Long-only, 100% invested when long; cash earns the risk-free rate "
+        f"({RISK_FREE_RATE_ANNUAL*100:.0f}% p.a.); cost {TRANSACTION_COST*100:.1f}% per side. "
+        "The **baseline** row uses the same thresholds without the cubic filter "
+        "(buy at RSI < oversold, sell at RSI > overbought) to show what the forecast adds."
+    )
+
+    if cf_overbought <= cf_oversold:
+        st.error("Overbought threshold must be above the oversold threshold.")
+        st.stop()
+
+    with st.spinner("Running cubic-forecast backtest…"):
+        cf_df, cf_coefs, cf_xm, cf_xs = cubic_rsi_signals(
+            data, rsi_days_cf, cf_oversold, cf_overbought, cf_horizon, use_forecast=True)
+        cf_equity, cf_rets, cf_trades = backtest_cubic(cf_df, RISK_FREE_RATE_ANNUAL, exec_mode)
+
+        base_df, _, _, _ = cubic_rsi_signals(
+            data, rsi_days_cf, cf_oversold, cf_overbought, cf_horizon, use_forecast=False)
+        base_equity, base_rets, base_trades = backtest_cubic(base_df, RISK_FREE_RATE_ANNUAL, exec_mode)
+
+    bh_rets = data['Close'].pct_change().fillna(0)
+    bh_equity = (1 + bh_rets).cumprod()
+
+    # ---- Headline metrics ----
+    cf_total = cf_equity.iloc[-1] - 1
+    bh_total = bh_equity.iloc[-1] - 1
+    cf_mdd = (cf_equity / cf_equity.cummax() - 1).min()
+    bh_mdd = (bh_equity / bh_equity.cummax() - 1).min()
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Strategy Return", f"{cf_total*100:.1f}%", delta=f"{(cf_total-bh_total)*100:+.1f} pp vs B&H")
+    m2.metric("Buy & Hold Return", f"{bh_total*100:.1f}%")
+    m3.metric("Strategy Max DD", f"{cf_mdd*100:.1f}%", delta=f"B&H {bh_mdd*100:.1f}%", delta_color="off")
+    n_closed = int((cf_trades['exit_reason'] != "Open (marked to market)").sum()) if len(cf_trades) else 0
+    m4.metric("Closed Trades", n_closed)
+    m5.metric("Time in Market", f"{cf_df['Position'].mean()*100:.0f}%")
+
+    # ---- Main chart: price + signals, RSI + forecast, equity ----
+    fig4 = plt.figure(figsize=(16, 13), facecolor=DARK_BG)
+    gs = gridspec.GridSpec(3, 1, height_ratios=[2.2, 1.3, 1.8], hspace=0.32)
+    axP = fig4.add_subplot(gs[0]); axR = fig4.add_subplot(gs[1], sharex=axP)
+    axE = fig4.add_subplot(gs[2], sharex=axP)
+
+    style_ax(axP)
+    axP.plot(cf_df.index, cf_df['Close'], color='#cbd5e1', lw=1.2, label="Close")
+    in_mkt = cf_df['Position'].values.astype(bool)
+    axP.fill_between(cf_df.index, cf_df['Close'].min(), cf_df['Close'].max(),
+                     where=in_mkt, color=GREEN, alpha=0.07, step='post', label="Long (signal)")
+    b_idx = cf_df.index[cf_df['BuySig']]; s_idx = cf_df.index[cf_df['SellSig']]
+    axP.scatter(b_idx, cf_df.loc[b_idx, 'Close'], marker='^', color=GREEN, s=90, zorder=5,
+                label="Buy signal (oversold + forecast up)")
+    axP.scatter(s_idx, cf_df.loc[s_idx, 'Close'], marker='v', color=RED, s=90, zorder=5,
+                label="Sell signal (overbought + forecast down)")
+    axP.set_title(f"{TICKER} — Price with Cubic-Forecast RSI Signals", color=WHITE,
+                  fontsize=12, fontweight='bold')
+    axP.set_ylabel("Price", color=TEXT_COLOR, fontsize=9)
+    axP.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8, loc='upper left')
+
+    style_ax(axR)
+    axR.plot(cf_df.index, cf_df['RSI'], color=BLUE, lw=1.1, label=f"RSI({rsi_days_cf})")
+    axR.axhline(cf_oversold, color=GREEN, ls='--', lw=0.9, label=f"Oversold {cf_oversold}")
+    axR.axhline(cf_overbought, color=RED, ls='--', lw=0.9, label=f"Overbought {cf_overbought}")
+    axR.fill_between(cf_df.index, 0, 100, where=cf_df['ArmedBuy'].values, color=GREEN, alpha=0.10,
+                     step='post', label="Buy setup armed")
+    axR.fill_between(cf_df.index, 0, 100, where=cf_df['ArmedSell'].values, color=RED, alpha=0.10,
+                     step='post', label="Sell setup armed")
+    axR.scatter(b_idx, cf_df.loc[b_idx, 'RSI'], marker='^', color=GREEN, s=50, zorder=5)
+    axR.scatter(s_idx, cf_df.loc[s_idx, 'RSI'], marker='v', color=RED, s=50, zorder=5)
+    axR.set_ylim(0, 100)
+    axR.set_ylabel("RSI", color=TEXT_COLOR, fontsize=9)
+    axR.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=7,
+               loc='upper left', ncol=5)
+
+    style_ax(axE)
+    axE.plot(cf_equity.index, cf_equity.values * 10000, color=GOLD, lw=1.8, label="Cubic-forecast strategy")
+    axE.plot(base_equity.index, base_equity.values * 10000, color=CYAN, lw=1.2, alpha=0.8,
+             label="Baseline (no cubic filter)")
+    axE.plot(bh_equity.index, bh_equity.values * 10000, '--', color='#64748b', lw=1.2, label="Buy & Hold")
+    axE.set_ylabel("Portfolio Value (start 10,000)", color=TEXT_COLOR, fontsize=9)
+    axE.set_title("Portfolio Value Comparison", color=WHITE, fontsize=12, fontweight='bold')
+    axE.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8, loc='upper left')
+    axEd = axE.twinx()
+    dd_series = (cf_equity / cf_equity.cummax() - 1) * 100
+    axEd.fill_between(dd_series.index, dd_series.values, 0, color=RED, alpha=0.15)
+    axEd.set_ylim(-100, 0)
+    axEd.tick_params(colors=TEXT_COLOR, labelsize=7)
+    axEd.set_ylabel("Strategy drawdown %", fontsize=7, color=TEXT_COLOR)
+    for spine in axEd.spines.values():
+        spine.set_color(GRID_COLOR)
+
+    fig4.patch.set_facecolor(DARK_BG)
+    st.pyplot(fig4)
+    plt.close(fig4)
+
+    # ---- Latest cubic fit (illustration of the current forecast) ----
+    st.markdown("#### 🔍 Latest Cubic Fit of the RSI")
+    last_c = cf_coefs[-1]
+    if not np.any(np.isnan(last_c)):
+        w = rsi_days_cf
+        x_hist = np.arange(w)
+        x_fine = np.linspace(0, w - 1 + cf_horizon, 200)
+        fitted = np.polyval(last_c, (x_fine - cf_xm) / cf_xs)
+        fig5, ax5 = plt.subplots(figsize=(14, 4), facecolor=DARK_BG)
+        style_ax(ax5, PANEL_BG2)
+        ax5.plot(x_hist - (w - 1), cf_df['RSI'].values[-w:], 'o-', color=BLUE, lw=1.2, ms=4,
+                 label=f"RSI, last {w} days")
+        ax5.plot(x_fine - (w - 1), fitted, color=GOLD, lw=1.8, label="Cubic fit")
+        fc_last = cf_df['RSI_fc'].iloc[-1]
+        ax5.scatter([cf_horizon], [fc_last], color=GOLD, s=90, marker='*', zorder=5,
+                    label=f"Forecast in {cf_horizon} day(s): {fc_last:.1f}")
+        ax5.axhline(cf_oversold, color=GREEN, ls='--', lw=0.9)
+        ax5.axhline(cf_overbought, color=RED, ls='--', lw=0.9)
+        ax5.axvline(0, color=WHITE, ls=':', lw=0.8, alpha=0.6)
+        ax5.set_xlabel("Days relative to today (0 = last close)", color=TEXT_COLOR, fontsize=9)
+        ax5.set_ylabel("RSI", color=TEXT_COLOR, fontsize=9)
+        ax5.legend(facecolor=PANEL_BG2, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8)
+        fig5.patch.set_facecolor(DARK_BG)
+        st.pyplot(fig5)
+        plt.close(fig5)
+
+    # ---- Current signal ----
+    st.markdown("#### 📍 Current Signal")
+    last = cf_df.iloc[-1]
+    cur_rsi, cur_fc = float(last['RSI']), float(last['RSI_fc'])
+    direction = "rising ↗" if cur_fc > cur_rsi else "falling ↘"
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Last Close", f"{float(last['Close']):.2f}")
+    k2.metric("Current RSI", f"{cur_rsi:.1f}")
+    k3.metric(f"Cubic forecast (+{cf_horizon}d)", f"{cur_fc:.1f}", delta=direction, delta_color="off")
+    if last['BuySig']:
+        k4.success("🟢 BUY signal today")
+    elif last['SellSig']:
+        k4.error("🔴 SELL signal today")
+    elif last['Position'] == 1:
+        k4.info("🟢 HOLD LONG" + (" — exit armed (overbought), waiting for turn down"
+                                 if last['ArmedSell'] else ""))
+    elif last['ArmedBuy']:
+        k4.warning("🟡 FLAT — buy armed (oversold), waiting for forecast to turn up")
+    else:
+        k4.info("⚪ FLAT — no setup")
+
+    # ---- Trade logs ----
+    def show_trades(tdf):
+        if tdf is not None and len(tdf) > 0:
+            disp = tdf[['entry_date', 'exit_date', 'entry_price', 'exit_price',
+                        'held_days', 'net_ret', 'exit_reason']].copy()
+            disp['entry_price'] = disp['entry_price'].round(2)
+            disp['exit_price'] = disp['exit_price'].round(2)
+            disp['net_ret'] = (disp['net_ret'] * 100).round(2).astype(str) + '%'
+            disp.columns = ['Entry', 'Exit', 'Entry Px', 'Exit Px', 'Days', 'Net Ret %', 'Reason']
+            st.dataframe(disp, use_container_width=True)
+        else:
+            st.info("No trades generated.")
+
+    t1, t2 = st.columns(2)
+    with t1:
+        with st.expander("📋 Cubic-Forecast Strategy — Trade Log", expanded=True):
+            show_trades(cf_trades)
+    with t2:
+        with st.expander("📋 Baseline (no cubic filter) — Trade Log"):
+            show_trades(base_trades)
+
+    # ---- Performance summary ----
+    st.markdown("#### 📊 Performance Summary")
+    bh_df_dummy = pd.DataFrame({'Position': np.ones(len(data))}, index=data.index)
+    summary_cf = pd.DataFrame([
+        cubic_performance(cf_equity, cf_rets, cf_trades, cf_df, RISK_FREE_RATE_ANNUAL,
+                          "RSI + Cubic Forecast"),
+        cubic_performance(base_equity, base_rets, base_trades, base_df, RISK_FREE_RATE_ANNUAL,
+                          "Baseline: RSI thresholds only"),
+        cubic_performance(bh_equity, bh_rets, pd.DataFrame(), bh_df_dummy, RISK_FREE_RATE_ANNUAL,
+                          "Buy & Hold"),
+    ]).set_index("Strategy")
+    st.dataframe(summary_cf, use_container_width=True)
+    st.caption(
+        "Sharpe uses daily returns in excess of the risk-free rate. Calmar = CAGR / |max drawdown|. "
+        "A still-open position is marked to market at the last close and is not counted in Trades, "
+        "Win Rate or averages. Parameters are chosen by you, not optimised, so the full period is "
+        "out of sample with respect to parameter search.")
+
+st.caption("Developed for educational and research purposes — RSI Pivot + Long/Short + Cubic Forecast Strategy Suite.")
 
 
 

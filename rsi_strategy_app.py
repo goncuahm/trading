@@ -47,7 +47,11 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("💰 RSI Accumulation (IRR) Strategy")
 acc_rsi_days = st.sidebar.slider("RSI Period (Accumulation)", 5, 30, 14)
 acc_th_range = st.sidebar.slider("RSI threshold search range (buy 1 share when RSI below)", 5, 95, (10, 70))
-acc_min_buys = st.sidebar.slider("Minimum number of purchases for a valid threshold", 1, 100, 10)
+acc_min_per_year = st.sidebar.number_input(
+    "Minimum purchases per year (on average)", min_value=0.0, max_value=252.0, value=1.0, step=0.5,
+    help="A threshold is valid only if it buys at least this many shares per year on average "
+         "(total purchases ÷ years in the period). 1 = at least one purchase a year on average.")
+acc_min_buys = st.sidebar.slider("Minimum total number of purchases", 1, 100, 1)
 acc_include_cost = st.sidebar.checkbox("Include transaction cost on each purchase", value=True)
 
 st.sidebar.markdown("---")
@@ -526,6 +530,49 @@ def accumulation_result(df, rsi_vals, threshold, include_cost=True):
     }
 
 
+def budget_plan_backtest(df, buy_idx, monthly_budget, amount_per_purchase, rf_annual, include_cost=True):
+    """
+    Replay the plan with a real budget.
+      * On the first trading day of each month the monthly budget is deposited into a cash account
+        that earns the risk-free rate (it can go negative if purchases run ahead of the budget,
+        i.e. the plan borrows at the risk-free rate).
+      * On each signal day, buy floor(amount_per_purchase / price) whole shares from that account.
+    Benchmarks with the same deposits:
+      * Monthly buying: each month, buy as many whole shares as the cash account allows.
+      * Risk-free saving: deposits only earn the risk-free rate.
+    Returns (daily DataFrame, purchase log DataFrame, deposit dates/amounts).
+    """
+    C = df['Close'].values; dates = df.index; n = len(df)
+    cm = (1 + TRANSACTION_COST) if include_cost else 1.0
+    daily_rf = (1 + rf_annual) ** (1 / 252) - 1
+    month_start = np.r_[True, dates.month[1:] != dates.month[:-1]]
+    is_buy = np.zeros(n, dtype=bool); is_buy[buy_idx] = True
+
+    sh = 0; cash = 0.0; dca_sh = 0; dca_cash = 0.0; rf_acc = 0.0; contrib = 0.0; invested = 0.0
+    rows, log = [], []
+    for t in range(n):
+        if t > 0:
+            cash *= 1 + daily_rf; dca_cash *= 1 + daily_rf; rf_acc *= 1 + daily_rf
+        if month_start[t]:
+            cash += monthly_budget; dca_cash += monthly_budget; rf_acc += monthly_budget
+            contrib += monthly_budget
+            k = int(dca_cash // (C[t] * cm))                 # monthly buying benchmark
+            dca_sh += k; dca_cash -= k * C[t] * cm
+        if is_buy[t]:
+            k = int(amount_per_purchase // (C[t] * cm))
+            if k > 0:
+                spend = k * C[t] * cm
+                sh += k; cash -= spend; invested += spend
+                log.append({"Date": dates[t].date(), "Price": C[t], "Shares": k, "Amount": spend})
+        rows.append((contrib, invested, sh, sh * C[t], cash, sh * C[t] + cash,
+                     dca_sh * C[t] + dca_cash, rf_acc))
+    out = pd.DataFrame(rows, index=dates, columns=[
+        "Contributed", "Invested", "Shares", "Share value", "Cash account", "Total wealth",
+        "Monthly buying wealth", "Risk-free saving"])
+    dep_idx = np.where(month_start)[0]
+    return out, pd.DataFrame(log), dep_idx
+
+
 def accumulation_path(df, idx, outlays, rf_cont):
     """Daily path: cumulative cash invested, market value of shares held, and the same
     cash flows compounded at the risk-free rate."""
@@ -565,7 +612,8 @@ tab1, tab2, tab3 = st.tabs(["💰 RSI Accumulation (IRR)", "📈 Long / Short St
 # =====================================================
 # TAB 1 — RSI accumulation strategy (IRR)
 # =====================================================
-with tab1:
+def render_accumulation_tab():
+    """Tab 1 body; returns early (instead of st.stop) so the other tabs still render."""
     st.subheader("RSI Accumulation — Buy One Share Every Day the RSI Is Below the Threshold, Never Sell")
 
     rf_cont = np.log(1 + RISK_FREE_RATE_ANNUAL)
@@ -576,8 +624,9 @@ with tab1:
         "**Σ S(tᵢ)·e^{r(T − tᵢ)} = S(T)·N**, where T is the last date and time is in years. "
         f"Purchases {'include' if acc_include_cost else 'exclude'} the {TRANSACTION_COST*100:.1f}% cost; "
         "the shares are valued at the last close.\n\n"
-        f"The threshold is chosen from {acc_th_range[0]} to {acc_th_range[1]} to **maximise r** (at least "
-        f"{acc_min_buys} purchases). Benchmarks: **buy & hold** (one share bought on the first day), "
+        f"The threshold is chosen from {acc_th_range[0]} to {acc_th_range[1]} to **maximise r**, subject to "
+        f"at least **{acc_min_per_year:g} purchase(s) per year on average** and at least {acc_min_buys} "
+        "purchase(s) in total. Benchmarks: **buy & hold** (one share bought on the first day), "
         "**buy one share every day** (the same plan without the RSI filter), and the **risk-free rate**."
     )
 
@@ -591,10 +640,16 @@ with tab1:
     thresholds = list(range(acc_th_range[0], acc_th_range[1] + 1))
     res = [accumulation_result(acc_eval, rsi_eval, th, acc_include_cost) for th in thresholds]
     grid = pd.DataFrame([{k: v for k, v in r_.items() if k not in ("idx", "outlays", "tau")} for r_ in res])
-    valid = grid[(grid['buys'] >= acc_min_buys) & grid['irr_cont'].notna()]
+    years_eval = max((acc_eval.index[-1] - acc_eval.index[0]).days / 365.25, 1e-9)
+    grid['buys_per_year'] = grid['buys'] / years_eval
+    grid['valid'] = ((grid['buys'] >= acc_min_buys) & (grid['buys_per_year'] >= acc_min_per_year)
+                     & grid['irr_cont'].notna())
+    valid = grid[grid['valid']]
     if valid.empty:
-        st.warning("No threshold gives enough purchases. Lower the minimum or widen the range.")
-        st.stop()
+        st.warning(f"No threshold buys at least {acc_min_per_year:g} share(s) per year on average "
+                   f"(and {acc_min_buys} in total). Lower the minimums or widen the threshold range.")
+        return
+    min_valid_th = int(valid['threshold'].min())
     best_row = valid.loc[valid['irr_cont'].idxmax()]
     best_th = int(best_row['threshold'])
     best = res[thresholds.index(best_th)]
@@ -622,7 +677,8 @@ with tab1:
               delta=f"{(best['irr_cont'] - ed_cont)*100:+.2f} pp (cont.)")
     a5.metric("Risk-free (annual)", f"{RISK_FREE_RATE_ANNUAL*100:.2f}%",
               delta=f"{(best['irr_cont'] - rf_cont)*100:+.2f} pp (cont.)")
-    a6.metric("Shares accumulated", f"{best['buys']:,}")
+    a6.metric("Shares accumulated", f"{best['buys']:,}",
+              delta=f"{best['buys'] / years_eval:.1f} per year (min {acc_min_per_year:g})", delta_color="off")
     b1, b2, b3, b4 = st.columns(4)
     b1.metric("Total invested", f"{best['invested']:,.0f}")
     b2.metric("Value at last close", f"{best['final_value']:,.0f}")
@@ -637,7 +693,7 @@ with tab1:
     # ---- IRR vs threshold ----
     figT, (axT1, axT2) = plt.subplots(1, 2, figsize=(16, 5), facecolor=DARK_BG)
     style_ax(axT1, PANEL_BG2)
-    ok = grid['buys'] >= acc_min_buys
+    ok = grid['valid']
     axT1.plot(grid['threshold'], (np.exp(grid['irr_cont']) - 1) * 100, color=GOLD, lw=1.0, alpha=0.4)
     axT1.plot(grid.loc[ok, 'threshold'], (np.exp(grid.loc[ok, 'irr_cont']) - 1) * 100, 'o-', color=GOLD,
               lw=1.8, ms=3, label="IRR of RSI accumulation")
@@ -645,6 +701,8 @@ with tab1:
     axT1.axhline((np.exp(ed_cont) - 1) * 100, color=CYAN, ls='-.', lw=1.2, label="Buy every day")
     axT1.axhline(RISK_FREE_RATE_ANNUAL * 100, color=GREEN, ls=':', lw=1.4, label="Risk-free")
     axT1.axvline(best_th, color=WHITE, ls=':', lw=1)
+    axT1.axvspan(grid['threshold'].min() - 0.5, min_valid_th - 0.5, color=RED, alpha=0.08,
+                 label=f"Too few purchases (< {acc_min_per_year:g}/yr)")
     axT1.scatter([best_th], [(np.exp(best['irr_cont']) - 1) * 100], marker='*', s=220, color=WHITE,
                  edgecolor='black', zorder=5, label=f"Optimum: RSI < {best_th}")
     axT1.set_xlabel("RSI threshold (buy when RSI below)", color=TEXT_COLOR, fontsize=9)
@@ -653,9 +711,11 @@ with tab1:
     axT1.legend(facecolor=PANEL_BG2, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8)
 
     style_ax(axT2, PANEL_BG2)
-    axT2.bar(grid['threshold'], grid['buys'], color=BLUE, alpha=0.6, label="Shares bought")
+    axT2.bar(grid['threshold'], grid['buys_per_year'], color=np.where(grid['valid'], BLUE, '#475569'),
+             alpha=0.7, label="Purchases per year")
+    axT2.axhline(acc_min_per_year, color=RED, ls='--', lw=1.0, label=f"Minimum {acc_min_per_year:g} per year")
     axT2.set_xlabel("RSI threshold", color=TEXT_COLOR, fontsize=9)
-    axT2.set_ylabel("Shares bought", color=TEXT_COLOR, fontsize=9)
+    axT2.set_ylabel("Purchases per year (average)", color=TEXT_COLOR, fontsize=9)
     axT2b = axT2.twinx()
     axT2b.plot(grid['threshold'], grid['profit'], color=ORANGE, lw=1.8, label="Profit")
     axT2b.tick_params(colors=TEXT_COLOR, labelsize=7)
@@ -664,7 +724,7 @@ with tab1:
     h1, l1 = axT2.get_legend_handles_labels(); h2, l2 = axT2b.get_legend_handles_labels()
     axT2.legend(h1 + h2, l1 + l2, facecolor=PANEL_BG2, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8,
                 loc='upper left')
-    axT2.set_title("Size of the Plan: Shares Bought and Profit", color=WHITE, fontsize=11, fontweight='bold')
+    axT2.set_title("Size of the Plan: Purchases per Year and Profit", color=WHITE, fontsize=11, fontweight='bold')
     figT.patch.set_facecolor(DARK_BG)
     st.pyplot(figT)
     plt.close(figT)
@@ -724,15 +784,134 @@ with tab1:
          "Annual return (continuous)": f"{rf_cont*100:.2f}%",
          "Annual return (effective)": f"{RISK_FREE_RATE_ANNUAL*100:.2f}%"},
     ])
-    st.dataframe(comp, use_container_width=True, hide_index=True)
+    st.dataframe(comp.astype(str), use_container_width=True, hide_index=True)
+
+    # ---- Budget plan: how many shares to buy, and what the plan would be worth now ----
+    st.markdown("---")
+    st.markdown("### 💼 Your Savings Plan")
+    bc1, bc2 = st.columns([1, 2])
+    with bc1:
+        monthly_budget = st.number_input("Monthly budget for this asset", min_value=0.0, value=10000.0,
+                                         step=500.0, key="acc_monthly_budget")
+    annual_budget = 12 * monthly_budget
+    hist_per_year = best['buys'] / years_eval
+    amount_per_purchase = annual_budget / hist_per_year if hist_per_year > 0 else 0.0
+    with bc2:
+        st.markdown(
+            f"**Annual budget:** {annual_budget:,.0f}  \n"
+            f"**Signal:** RSI({acc_rsi_days}) < **{best_th}** — historically **{hist_per_year:.1f}** "
+            f"purchase days per year (your minimum: {acc_min_per_year:g})  \n"
+            f"**Amount per purchase day** = annual budget ÷ purchases per year = **{amount_per_purchase:,.0f}**")
+
+    last_px = float(C_eval[-1]); cmx = (1 + TRANSACTION_COST) if acc_include_cost else 1.0
+    n_today = int(amount_per_purchase // (last_px * cmx)) if last_px > 0 else 0
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Current RSI", f"{float(rsi_eval[-1]):.1f}", delta=f"threshold {best_th}", delta_color="off")
+    s2.metric("Last Close", f"{last_px:.2f}")
+    if float(rsi_eval[-1]) < best_th:
+        if n_today > 0:
+            s3.success(f"🟢 BUY {n_today:,} shares today ≈ {n_today * last_px * cmx:,.0f}")
+        else:
+            s3.warning(f"🟢 Signal today, but {amount_per_purchase:,.0f} buys less than one share at {last_px:.2f}")
+    else:
+        s3.info(f"⚪ No purchase today — wait for RSI < {best_th}. "
+                f"On the next signal buy ≈ {n_today:,} shares (at today's price).")
+
+    plan, plan_log, dep_idx = budget_plan_backtest(
+        acc_eval, best['idx'], monthly_budget, amount_per_purchase, RISK_FREE_RATE_ANNUAL, acc_include_cost)
+
+    if monthly_budget > 0:
+        # Money-weighted annual return of each plan on the monthly deposits
+        T_last = acc_eval.index[-1]
+        dep_tau = (T_last - acc_eval.index[dep_idx]).days.values / 365.25
+        dep_amt = np.full(len(dep_idx), monthly_budget)
+        fin = plan.iloc[-1]
+        irr_plan = solve_irr(dep_amt, dep_tau, fin["Total wealth"])
+        irr_dca = solve_irr(dep_amt, dep_tau, fin["Monthly buying wealth"])
+
+        st.markdown(f"#### 📈 If You Had Followed This Plan Since {acc_eval.index[0].date()}")
+        w1, w2, w3, w4, w5 = st.columns(5)
+        w1.metric("Total deposited", f"{fin['Contributed']:,.0f}")
+        w2.metric("Invested in shares", f"{fin['Invested']:,.0f}",
+                  delta=f"{int(fin['Shares']):,} shares", delta_color="off")
+        w3.metric("Wealth now (shares + cash)", f"{fin['Total wealth']:,.0f}",
+                  delta=f"annual return {pct_eff(irr_plan)}", delta_color="off")
+        w4.metric("Same deposits, buying monthly", f"{fin['Monthly buying wealth']:,.0f}",
+                  delta=f"annual return {pct_eff(irr_dca)}", delta_color="off")
+        w5.metric("Same deposits at risk-free", f"{fin['Risk-free saving']:,.0f}",
+                  delta=f"{RISK_FREE_RATE_ANNUAL*100:.1f}% p.a.", delta_color="off")
+        st.caption(
+            "Deposits are made on the first trading day of each month into a cash account earning the "
+            "risk-free rate; each signal day buys whole shares from it. A negative cash account means the "
+            "plan bought ahead of its budget (borrowing at the risk-free rate). 'Annual return' is the "
+            "money-weighted return on the monthly deposits.")
+
+        figB, axB1 = plt.subplots(figsize=(16, 5.5), facecolor=DARK_BG)
+        style_ax(axB1)
+        axB1.plot(plan.index, plan["Total wealth"], color=GOLD, lw=2.0, label=f"RSI < {best_th} plan: shares + cash")
+        axB1.plot(plan.index, plan["Share value"], color=GOLD, lw=1.0, ls='--', alpha=0.7, label="…of which shares")
+        axB1.plot(plan.index, plan["Monthly buying wealth"], color=CYAN, lw=1.4, label="Same deposits, buying monthly")
+        axB1.plot(plan.index, plan["Risk-free saving"], color=GREEN, lw=1.3, ls=':', label="Same deposits at risk-free")
+        axB1.plot(plan.index, plan["Contributed"], color='#94a3b8', lw=1.1, ls='--', label="Total deposited")
+        if len(plan_log):
+            ld = pd.to_datetime(plan_log['Date'])
+            axB1.scatter(ld, plan.loc[ld, "Total wealth"], color=GREEN, s=16, zorder=5, label="Purchase day")
+        axB1.set_ylabel("Value", color=TEXT_COLOR, fontsize=9)
+        axB1.set_title(f"Savings Plan with {monthly_budget:,.0f} per Month — Wealth Over Time",
+                       color=WHITE, fontsize=12, fontweight='bold')
+        axB1.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8, loc='upper left')
+        figB.patch.set_facecolor(DARK_BG)
+        st.pyplot(figB)
+        plt.close(figB)
+
+        # Year-by-year table
+        st.markdown("#### 📅 Year by Year")
+        yrs = plan.index.year
+        ye = plan.groupby(yrs).last()
+        first = plan.groupby(yrs).first()
+        prev_contrib = ye["Contributed"].shift(1).fillna(0); prev_inv = ye["Invested"].shift(1).fillna(0)
+        if len(plan_log):
+            py = pd.to_datetime(plan_log['Date']).dt.year
+            buys_y = plan_log.groupby(py)['Shares'].agg(['count', 'sum'])
+        else:
+            buys_y = pd.DataFrame(columns=['count', 'sum'])
+        ytab = pd.DataFrame({
+            "Deposited": (ye["Contributed"] - prev_contrib).round(0),
+            "Purchase days": buys_y['count'].reindex(ye.index).fillna(0).astype(int),
+            "Shares bought": buys_y['sum'].reindex(ye.index).fillna(0).astype(int),
+            "Invested": (ye["Invested"] - prev_inv).round(0),
+            "Shares held (year end)": ye["Shares"].astype(int),
+            "Share value": ye["Share value"].round(0),
+            "Cash account": ye["Cash account"].round(0),
+            "Total wealth": ye["Total wealth"].round(0),
+            "Monthly-buying wealth": ye["Monthly buying wealth"].round(0),
+            "Risk-free wealth": ye["Risk-free saving"].round(0),
+        })
+        ytab.index.name = "Year"
+        st.dataframe(ytab, use_container_width=True)
+        avg_inv_year = fin["Invested"] / years_eval
+        st.caption(f"On average {avg_inv_year:,.0f} invested per year against an annual budget of "
+                   f"{annual_budget:,.0f}. Years with many signals invest more than the budget, quiet years "
+                   "less; the difference sits in the cash account. The current year is partial.")
+
+        with st.expander(f"📋 Purchase log ({len(plan_log)} purchase days)"):
+            if len(plan_log):
+                pl = plan_log.copy(); pl['Price'] = pl['Price'].round(2); pl['Amount'] = pl['Amount'].round(0)
+                st.dataframe(pl, use_container_width=True, hide_index=True)
+                st.download_button("⬇️ Download purchase log (CSV)", pl.to_csv(index=False).encode("utf-8"),
+                                   file_name=f"{TICKER}_rsi_savings_purchases.csv", mime="text/csv")
+            else:
+                st.info("The amount per purchase was too small to buy a single share on any signal day.")
 
     # ---- All thresholds ----
     with st.expander("📋 IRR for every threshold"):
         gd = grid.copy()
         gd['IRR (effective)'] = ((np.exp(gd['irr_cont']) - 1) * 100).round(2)
-        gd = gd[['threshold', 'buys', 'invested', 'final_value', 'profit', 'avg_price', 'IRR (effective)']].round(2)
-        gd.columns = ['Buy when RSI <', 'Shares', 'Invested', 'Value', 'Profit', 'Avg cost', 'IRR % p.a.']
-        gd['Valid'] = np.where(grid['buys'] >= acc_min_buys, "✓", "too few buys")
+        gd = gd[['threshold', 'buys', 'buys_per_year', 'invested', 'final_value', 'profit', 'avg_price',
+                 'IRR (effective)']].round(2)
+        gd.columns = ['Buy when RSI <', 'Shares', 'Per year', 'Invested', 'Value', 'Profit', 'Avg cost',
+                      'IRR % p.a.']
+        gd['Valid'] = np.where(grid['valid'], "✓", "too few purchases")
         st.dataframe(gd, use_container_width=True, hide_index=True)
 
     # ---- Current signal ----
@@ -748,10 +927,15 @@ with tab1:
 
     st.caption(
         "Note: the IRR measures the return per unit invested, not the size of the plan. Very low thresholds "
-        "buy only a few shares near deep lows and can show a high IRR on a small amount; the right-hand chart "
-        "above shows how many shares each threshold buys. The threshold is chosen on the same data it is "
+        "buy only a few shares near deep lows and can show a high IRR on a small amount; the minimum "
+        "purchases per year rules these out, and the right-hand chart above shows how often each threshold "
+        "buys. The per-year minimum is an average over the whole period: purchases can still cluster in a "
+        "few years. The threshold is chosen on the same data it is "
         "evaluated on, so the optimal IRR is an in-sample figure.")
 
+
+with tab1:
+    render_accumulation_tab()
 
 # =====================================================
 # TAB 2 — Long / Short strategies

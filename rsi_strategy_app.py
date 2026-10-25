@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import matplotlib.dates as mdates
 from datetime import datetime
 import itertools
 
@@ -43,27 +44,13 @@ rsi_entry_short = st.sidebar.slider("Short Entry: RSI above", 50, 90, 67)
 max_holding_days = st.sidebar.slider("Max Holding Days", 5, 60, 22)
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🎯 RSI + EMA Strategy (multi-entry)")
-rsi_days_e = st.sidebar.slider("RSI Period (RSI + EMA strategy)", 5, 30, 14)
-e_entry_range = st.sidebar.slider("Entry threshold search range (buy when RSI below)", 10, 50, (20, 35))
-e_ema_range = st.sidebar.slider("EMA period search range", 3, 60, (5, 30),
-                                help="Set both ends to the same value to fix the EMA period.")
-# EMA "green" = close at or above the EMA. (For an EMA this is the same as "EMA rising":
-# EMA_t - EMA_{t-1} = alpha * (Close_t - EMA_{t-1}), so the EMA rises exactly when the close is above it.)
-e_green_rule = "Close above EMA"
-e_objective = st.sidebar.selectbox(
-    "Optimise for (RSI + EMA)",
-    ["Cumulative profit (sum over all trades)",
-     "Average profit per trade",
-     "Cumulative profit / max drawdown"],
-    index=0)
-e_min_trades = st.sidebar.slider("Minimum closed trades for a valid setting (RSI + EMA)", 1, 50, 5)
-e_position_size = st.sidebar.number_input("Capital per position (₺)", min_value=100, value=1000, step=100)
-e_execution = st.sidebar.selectbox(
-    "Execute trades at (RSI + EMA)",
-    ["Same day's close", "Next day's open (no look-ahead)"], index=0,
-    help="Signals use the day's close. 'Same day's close' assumes you trade in the closing auction; "
-         "'next open' avoids any look-ahead.")
+st.sidebar.subheader("🕯️ Heikin-Ashi Strategy")
+ha_execution = st.sidebar.selectbox(
+    "Execute trades at (Heikin-Ashi)",
+    ["Next day's open (no look-ahead)", "Same day's close"], index=0,
+    help="The bar's colour is known only at the close. 'Next day's open' avoids look-ahead; "
+         "'Same day's close' assumes you trade in the closing auction.")
+ha_zoom_days = st.sidebar.slider("Heikin-Ashi candle chart: last N days", 30, 250, 120)
 
 # =====================================================
 # DOWNLOAD FUNCTION
@@ -371,146 +358,121 @@ def plot_equity_curve(ax, equity_curve, trade_df, color, label, title):
 
 
 # =====================================================
-# RSI + EMA STRATEGY — multiple entries, exit when EMA turns red
+# HEIKIN-ASHI STRATEGY — long while the HA bar is green, cash otherwise
 # =====================================================
 
-def ema_green(close, ema_len, rule="Close above EMA"):
-    """Boolean array: True = EMA signal green on that day (uses data up to that day only)."""
-    ema = close.ewm(span=ema_len, adjust=False).mean()
-    if rule.startswith("EMA rising"):
-        green = (ema > ema.shift(1)).to_numpy(dtype=bool, copy=True)
-        green[0] = False
-    else:
-        green = (close >= ema).to_numpy(dtype=bool, copy=True)
-    return green, ema
-
-
-def next_red_index(green):
-    """For every day i, the first day j > i on which the EMA signal is red (-1 if none)."""
-    n = len(green)
-    nxt = np.full(n, -1, dtype=int)
-    upcoming = -1
-    for i in range(n - 1, -1, -1):
-        nxt[i] = upcoming
-        if not green[i]:
-            upcoming = i
-    return nxt
-
-
-def rsi_ema_trades(df, rsi_vals, green, next_red, entry_th, execution="close"):
-    """One position per day with RSI < entry_th and EMA green; each closes on the next red day."""
-    O = df['Open'].values; C = df['Close'].values; dates = df.index
+def heikin_ashi(df):
+    """Heikin-Ashi bars computed recursively from past data only."""
+    O = df['Open'].values; H = df['High'].values; L = df['Low'].values; C = df['Close'].values
     n = len(df)
-    entries = np.where((rsi_vals < entry_th) & ~np.isnan(rsi_vals) & green)[0]
-    rows = []
-    for i in entries:
-        j = next_red[i]
+    ha_c = (O + H + L + C) / 4.0
+    ha_o = np.empty(n)
+    ha_o[0] = (O[0] + C[0]) / 2.0
+    for i in range(1, n):
+        ha_o[i] = (ha_o[i - 1] + ha_c[i - 1]) / 2.0
+    ha_h = np.maximum.reduce([H, ha_o, ha_c])
+    ha_l = np.minimum.reduce([L, ha_o, ha_c])
+    out = pd.DataFrame({'HA_Open': ha_o, 'HA_High': ha_h, 'HA_Low': ha_l, 'HA_Close': ha_c},
+                       index=df.index)
+    out['Green'] = out['HA_Close'] >= out['HA_Open']
+    return out
+
+
+def backtest_position(df, sig, risk_free_rate, execution="open"):
+    """
+    Daily backtest of a 0/1 position signal decided at the close of each day.
+    100% invested when long; cash earns the risk-free rate when flat; TRANSACTION_COST per side.
+    execution='open' : trade at the next day's open.   execution='close': trade at the same close.
+    Returns (equity Series, daily return Series, trade DataFrame, held-position Series).
+    """
+    O = df['Open'].values; C = df['Close'].values
+    sig = np.asarray(sig, dtype=int)
+    dates = df.index
+    n = len(df)
+    daily_rf = (1 + risk_free_rate) ** (1 / 252) - 1
+    rets = np.zeros(n); held = np.zeros(n)
+    trades, entry = [], None
+    for d in range(1, n):
+        p_old = sig[d - 2] if d >= 2 else 0
+        p_new = sig[d - 1]
         if execution == "close":
-            e_i, e_px = i, C[i]
-            closed = j >= 0
-            x_i = j if closed else n - 1
-            x_px = C[x_i]
+            r = p_new * (C[d] / C[d - 1] - 1) + (1 - p_new) * daily_rf
+            t_date, t_px = dates[d - 1], C[d - 1]
         else:
-            if i + 1 >= n:
-                continue
-            e_i, e_px = i + 1, O[i + 1]
-            closed = (j >= 0) and (j + 1 < n)
-            x_i = j + 1 if closed else n - 1
-            x_px = O[x_i] if closed else C[n - 1]
-        gross = x_px / e_px - 1
-        net = (1 + gross) * (1 - TRANSACTION_COST) ** (2 if closed else 1) - 1
-        rows.append({
-            "entry_date": dates[e_i], "exit_date": dates[x_i],
-            "entry_rsi": rsi_vals[i],
-            "entry_price": e_px, "exit_price": x_px,
-            "held_days": x_i - e_i, "gross_ret": gross, "net_ret": net,
-            "status": "Closed" if closed else "Open (marked to market)",
-            "_e": e_i, "_x": x_i,
-        })
-    return pd.DataFrame(rows)
+            overnight = p_old * (O[d] / C[d - 1] - 1)
+            intraday = p_new * (C[d] / O[d] - 1)
+            r = (1 + overnight) * (1 + intraday) - 1 + (1 - p_new) * daily_rf
+            t_date, t_px = dates[d], O[d]
+        if p_new != p_old:
+            r = (1 + r) * (1 - TRANSACTION_COST) - 1
+            if p_new == 1:
+                entry = (t_date, t_px, d)
+            elif entry is not None:
+                gross = t_px / entry[1] - 1
+                trades.append({"entry_date": entry[0], "exit_date": t_date,
+                               "entry_price": entry[1], "exit_price": t_px,
+                               "held_days": d - entry[2], "gross_ret": gross,
+                               "net_ret": (1 + gross) * (1 - TRANSACTION_COST) ** 2 - 1,
+                               "status": "Closed"})
+                entry = None
+        rets[d] = r; held[d] = p_new
+    if entry is not None:
+        gross = C[-1] / entry[1] - 1
+        trades.append({"entry_date": entry[0], "exit_date": dates[-1],
+                       "entry_price": entry[1], "exit_price": C[-1],
+                       "held_days": n - 1 - entry[2], "gross_ret": gross,
+                       "net_ret": (1 + gross) * (1 - TRANSACTION_COST) - 1,
+                       "status": "Open (marked to market)"})
+    return (pd.Series(np.cumprod(1 + rets), index=dates), pd.Series(rets, index=dates),
+            pd.DataFrame(trades), pd.Series(held, index=dates))
 
 
-def multi_pnl_curve(df, trades, size):
-    """
-    Daily mark-to-market P&L (₺) of all positions and the number of open positions.
-    Open position (entry cost paid): size * (C[t] * (1 - cost) / entry_price - 1);
-    closed position: realised net P&L from its exit day on. Vectorised with difference arrays.
-    """
-    C = df['Close'].values; n = len(df)
-    if trades is None or len(trades) == 0:
-        z = pd.Series(np.zeros(n), index=df.index)
-        return z, z.astype(int)
-    e = trades['_e'].values.astype(int); x = trades['_x'].values.astype(int)
-    closed = (trades['status'] == "Closed").values
-    end = np.where(closed, x, n)
-    inv = 1.0 / trades['entry_price'].values
-    d_inv = np.zeros(n + 1); d_cnt = np.zeros(n + 1); d_real = np.zeros(n + 1)
-    np.add.at(d_inv, e, inv);  np.add.at(d_inv, end, -inv)
-    np.add.at(d_cnt, e, 1);    np.add.at(d_cnt, end, -1)
-    np.add.at(d_real, x[closed], size * trades['net_ret'].values[closed])
-    s_inv = np.cumsum(d_inv)[:n]; cnt = np.cumsum(d_cnt)[:n]; real = np.cumsum(d_real)[:n]
-    pnl = size * (C * (1 - TRANSACTION_COST) * s_inv - cnt) + real
-    return pd.Series(pnl, index=df.index), pd.Series(cnt.astype(int), index=df.index)
+def equity_stats(equity, rets, risk_free_rate, held=None, trades=None, label=""):
+    n_years = max((len(equity) - 1) / 252, 1e-9)
+    daily_rf = (1 + risk_free_rate) ** (1 / 252) - 1
+    total = equity.iloc[-1] - 1
+    cagr = equity.iloc[-1] ** (1 / n_years) - 1
+    vol = rets.iloc[1:].std() * np.sqrt(252)
+    xs = rets.iloc[1:] - daily_rf
+    sharpe = np.sqrt(252) * xs.mean() / xs.std() if xs.std() > 0 else np.nan
+    mdd = (equity / equity.cummax() - 1).min()
+    calmar = cagr / abs(mdd) if mdd < 0 else np.nan
+    row = {"Strategy": label,
+           "Total Return": f"{total*100:.1f}%", "CAGR": f"{cagr*100:.1f}%",
+           "Volatility": f"{vol*100:.1f}%",
+           "Sharpe (excess of rf)": f"{sharpe:.2f}" if np.isfinite(sharpe) else "N/A",
+           "Max Drawdown": f"{mdd*100:.1f}%",
+           "Calmar": f"{calmar:.2f}" if np.isfinite(calmar) else "N/A",
+           "Time in Market": f"{held.iloc[1:].mean()*100:.0f}%" if held is not None else "—"}
+    if trades is not None and len(trades):
+        closed = trades[trades['status'] == "Closed"]
+        row.update({"Trades": len(closed),
+                    "Trades / year": f"{len(closed) / n_years:.1f}",
+                    "Win Rate": f"{(closed['net_ret'] > 0).mean()*100:.0f}%" if len(closed) else "N/A",
+                    "Avg Net / Trade": f"{closed['net_ret'].mean()*100:.2f}%" if len(closed) else "N/A",
+                    "Avg Hold (days)": f"{closed['held_days'].mean():.1f}" if len(closed) else "N/A"})
+    else:
+        row.update({"Trades": "—", "Trades / year": "—", "Win Rate": "—",
+                    "Avg Net / Trade": "—", "Avg Hold (days)": "—"})
+    return row
 
 
-def multi_trade_stats(trades, size):
-    if trades is None or len(trades) == 0:
-        return dict(total=0.0, n=0, n_closed=0, n_open=0, avg=np.nan, avg_closed=np.nan,
-                    win=np.nan, hold=np.nan)
-    closed = trades[trades['status'] == "Closed"]
-    return dict(
-        total=size * trades['net_ret'].sum(),
-        n=len(trades), n_closed=len(closed), n_open=len(trades) - len(closed),
-        avg=trades['net_ret'].mean(),
-        avg_closed=closed['net_ret'].mean() if len(closed) else np.nan,
-        win=(closed['net_ret'] > 0).mean() if len(closed) else np.nan,
-        hold=closed['held_days'].mean() if len(closed) else np.nan,
-    )
-
-
-def optimise_rsi_ema(df, rsi_len, entry_grid, ema_grid, green_rule, execution, size, objective, min_closed):
-    d = df.copy()
-    d['RSI'] = compute_rsi(d['Close'], rsi_len)
-    rsi_vals = d['RSI'].values
-    rows = []
-    for L in ema_grid:
-        green, _ = ema_green(d['Close'], L, green_rule)
-        nxt = next_red_index(green)
-        for E in entry_grid:
-            tr = rsi_ema_trades(d, rsi_vals, green, nxt, E, execution)
-            s = multi_trade_stats(tr, size)
-            if objective.startswith("Cumulative profit /") and s['n'] > 0:
-                pnl, _ = multi_pnl_curve(d, tr, size)
-                mdd = (pnl - pnl.cummax()).min()
-                s['score'] = s['total'] / abs(mdd) if mdd < 0 else np.inf
-            elif objective.startswith("Average"):
-                s['score'] = s['avg']
-            else:
-                s['score'] = s['total']
-            if s['n_closed'] < min_closed:
-                s['score'] = np.nan
-            rows.append({"Entry RSI <": E, "EMA": L, **s})
-    return d, rsi_vals, pd.DataFrame(rows)
-
-
-@st.cache_data(show_spinner=False)
-def cached_optimise_rsi_ema(df, rsi_len, entry_grid, ema_grid, green_rule, execution, size, objective, min_closed):
-    return optimise_rsi_ema(df, rsi_len, list(entry_grid), list(ema_grid), green_rule,
-                            execution, size, objective, min_closed)
-
-
-def best_from_grid(grid):
-    g = grid.dropna(subset=['score'])
-    if g.empty:
-        return None
-    return g.sort_values(['score', 'total'], ascending=False).iloc[0]
+def draw_ha_candles(ax, ha, width=0.6):
+    """Heikin-Ashi candlesticks (green = HA close >= HA open)."""
+    x = mdates.date2num(ha.index.to_pydatetime())
+    for xi, (o, h, l, c, g) in zip(x, ha[['HA_Open', 'HA_High', 'HA_Low', 'HA_Close', 'Green']].values):
+        col = GREEN if g else RED
+        ax.vlines(xi, l, h, color=col, lw=0.8, zorder=3)
+        ax.add_patch(plt.Rectangle((xi - width / 2, min(o, c)), width, max(abs(c - o), 1e-9),
+                                   facecolor=col, edgecolor=col, alpha=0.85, zorder=4))
+    ax.xaxis_date()
 
 
 # =====================================================
 # MAIN APP
 # =====================================================
 
-st.title("📊 RSI Strategy Suite — Pivot Optimizer + Long/Short + RSI/EMA")
+st.title("📊 Strategy Suite — RSI Pivot + Long/Short + Heikin-Ashi")
 
 data = download_stock_data(TICKER, str(START), END)
 
@@ -524,7 +486,7 @@ st.success(f"Downloaded **{len(data)}** trading days for **{TICKER}**  |  {str(S
 # TAB LAYOUT
 # ─────────────────────────────────────────────
 tab1, tab2, tab3 = st.tabs(["🔁 RSI Pivot Strategy", "📈 Long / Short Strategies",
-                             "🎯 RSI + EMA Strategy"])
+                             "🕯️ Heikin-Ashi Strategy"])
 
 # =====================================================
 # TAB 1 — original RSI pivot strategy (unchanged)
@@ -742,242 +704,158 @@ with tab2:
         plt.close(fig3)
 
 # =====================================================
-# TAB 3 — RSI + EMA strategy (multiple entries, exit when EMA turns red)
+# TAB 3 — Heikin-Ashi strategy
 # =====================================================
 with tab3:
-    st.subheader("RSI + EMA Strategy — Buy Oversold Days in a Green EMA, Exit When the EMA Turns Red")
+    st.subheader("Heikin-Ashi Strategy — Long While the HA Bar Is Green, Cash Otherwise")
 
-    exec_e = "open" if e_execution.startswith("Next") else "close"
-    entry_grid = tuple(range(e_entry_range[0], e_entry_range[1] + 1))
-    ema_grid = tuple(range(e_ema_range[0], e_ema_range[1] + 1))
-    green_txt = "close ≥ EMA (equivalently, the EMA is rising)"
-
+    exec_ha = "open" if ha_execution.startswith("Next") else "close"
     st.info(
-        f"**Rules** — RSI period **{rsi_days_e}**; EMA green = **{green_txt}**.\n\n"
-        f"**Buy:** on **every** day with RSI < **E** *and* the EMA green, open a new position of "
-        f"**₺{e_position_size:,.0f}** (positions can overlap).\n\n"
-        "**Sell:** close **all** open positions on the first day the EMA turns **red**. "
-        "No other exit; positions still open at the end are marked to market.\n\n"
-        f"**Search** — E from {entry_grid[0]} to {entry_grid[-1]} × EMA period from {ema_grid[0]} to "
-        f"{ema_grid[-1]} ({len(entry_grid) * len(ema_grid)} settings); objective: **{e_objective}**; "
-        f"at least {e_min_trades} closed trades. Cost {TRANSACTION_COST*100:.1f}% per side; "
-        f"execution: {e_execution}."
+        "**Rule** — Heikin-Ashi bars: HA close = (O + H + L + C) / 4, HA open = average of the previous "
+        "HA open and HA close. **Green bar (HA close ≥ HA open) → long; red bar → sell and hold cash.** "
+        f"Cash earns the risk-free rate ({RISK_FREE_RATE_ANNUAL*100:.0f}% p.a.). 100% invested when long, "
+        f"cost {TRANSACTION_COST*100:.1f}% per side, execution: **{ha_execution}**. "
+        "No parameters are estimated, so the whole period is a single out-of-sample backtest."
     )
 
-    with st.spinner(f"Searching {len(entry_grid) * len(ema_grid)} (E, EMA) settings…"):
-        e_df, e_rsi, e_grid = cached_optimise_rsi_ema(
-            data, rsi_days_e, entry_grid, ema_grid, e_green_rule, exec_e,
-            float(e_position_size), e_objective, e_min_trades)
+    ha = heikin_ashi(data)
+    ha_sig = ha['Green'].astype(int).values
+    ha_equity, ha_rets, ha_trades, ha_held = backtest_position(data, ha_sig, RISK_FREE_RATE_ANNUAL, exec_ha)
 
-    best = best_from_grid(e_grid)
-    if best is None:
-        st.warning("No (E, EMA) setting produced enough closed trades. "
-                   "Lower the minimum number of trades or widen the ranges.")
-        st.stop()
+    bh_rets = data['Close'].pct_change().fillna(0)
+    bh_equity = (1 + bh_rets).cumprod()
+    daily_rf = (1 + RISK_FREE_RATE_ANNUAL) ** (1 / 252) - 1
+    cash_rets = pd.Series(np.r_[0.0, np.full(len(data) - 1, daily_rf)], index=data.index)
+    cash_equity = (1 + cash_rets).cumprod()
 
-    bE, bL = int(best['Entry RSI <']), int(best['EMA'])
-    b_green, b_ema = ema_green(e_df['Close'], bL, e_green_rule)
-    b_next = next_red_index(b_green)
-    best_trades = rsi_ema_trades(e_df, e_rsi, b_green, b_next, bE, exec_e)
-    pnl, n_open = multi_pnl_curve(e_df, best_trades, e_position_size)
-    bst = multi_trade_stats(best_trades, e_position_size)
-    max_conc = int(n_open.max())
-    peak_cap = max_conc * e_position_size
-    mdd_try = float((pnl - pnl.cummax()).min())
-    bh_pnl = peak_cap * (e_df['Close'] / e_df['Close'].iloc[0] - 1)
+    # ---- Headline metrics ----
+    ha_total = ha_equity.iloc[-1] - 1; bh_total = bh_equity.iloc[-1] - 1
+    ha_mdd = (ha_equity / ha_equity.cummax() - 1).min(); bh_mdd = (bh_equity / bh_equity.cummax() - 1).min()
+    n_closed = int((ha_trades['status'] == "Closed").sum()) if len(ha_trades) else 0
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Strategy Return", f"{ha_total*100:.1f}%", delta=f"{(ha_total-bh_total)*100:+.1f} pp vs B&H")
+    m2.metric("Buy & Hold Return", f"{bh_total*100:.1f}%")
+    m3.metric("Cash Return", f"{(cash_equity.iloc[-1]-1)*100:.1f}%")
+    m4.metric("Strategy Max DD", f"{ha_mdd*100:.1f}%", delta=f"B&H {bh_mdd*100:.1f}%", delta_color="off")
+    m5.metric("Closed Trades", n_closed)
+    m6.metric("Time in Market", f"{ha_held.iloc[1:].mean()*100:.0f}%")
 
-    # ---- Optimal setting ----
-    st.markdown("#### 🏆 Optimal Setting")
-    o1, o2, o3, o4, o5, o6 = st.columns(6)
-    o1.metric("Entry: RSI below", bE)
-    o2.metric("EMA period", bL)
-    o3.metric("Cumulative profit", f"₺{bst['total']:,.0f}",
-              delta=f"{bst['total'] / e_position_size * 100:.0f}% of one position", delta_color="off")
-    o4.metric("Avg net profit / trade", f"{bst['avg']*100:.2f}%",
-              delta=f"closed only: {bst['avg_closed']*100:.2f}%" if bst['n_closed'] else None,
-              delta_color="off")
-    o5.metric("Trades (closed / open)", f"{bst['n_closed']} / {bst['n_open']}")
-    o6.metric("Win rate (closed)", f"{bst['win']*100:.0f}%" if bst['n_closed'] else "N/A")
-    p1, p2, p3, p4 = st.columns(4)
-    p1.metric("Avg holding (closed)", f"{bst['hold']:.1f} days" if bst['n_closed'] else "N/A")
-    p2.metric("Max positions open at once", max_conc, delta=f"peak capital ₺{peak_cap:,.0f}", delta_color="off")
-    p3.metric("Return on peak capital", f"{bst['total'] / peak_cap * 100:.1f}%" if peak_cap else "N/A",
-              delta=f"B&H same capital: {bh_pnl.iloc[-1] / peak_cap * 100:.1f}%" if peak_cap else None,
-              delta_color="off")
-    p4.metric("Max drawdown of P&L", f"₺{mdd_try:,.0f}")
+    # ---- Main chart: equity, price with HA colour ----
+    fig7 = plt.figure(figsize=(16, 11), facecolor=DARK_BG)
+    gs7 = gridspec.GridSpec(2, 1, height_ratios=[1.8, 1.6], hspace=0.3)
+    axA = fig7.add_subplot(gs7[0]); axB = fig7.add_subplot(gs7[1], sharex=axA)
 
-    # ---- Heatmaps over the search grid ----
-    if len(entry_grid) > 1 or len(ema_grid) > 1:
-        st.markdown("#### 🗺️ Search Grid")
-        hm_total = e_grid.pivot(index='EMA', columns='Entry RSI <', values='total')
-        hm_avg = e_grid.pivot(index='EMA', columns='Entry RSI <', values='avg') * 100
-        hm_valid = e_grid.pivot(index='EMA', columns='Entry RSI <', values='score').notna()
-        figH, (axH1, axH2) = plt.subplots(1, 2, figsize=(16, 6), facecolor=DARK_BG)
-        for axh, M, ttl in [(axH1, hm_total, "Cumulative profit (₺)"),
-                            (axH2, hm_avg, "Average net profit per trade (%)")]:
-            style_ax(axh, PANEL_BG2); axh.grid(False)
-            Mv = M.where(hm_valid)
-            mx = np.nanmax(np.abs(Mv.values)) if np.any(np.isfinite(Mv.values)) else 1.0
-            im = axh.imshow(Mv.values, aspect='auto', origin='lower', cmap='RdYlGn', vmin=-mx, vmax=mx,
-                            extent=[M.columns[0] - 0.5, M.columns[-1] + 0.5, M.index[0] - 0.5, M.index[-1] + 0.5])
-            axh.scatter([bE], [bL], marker='*', s=260, color=WHITE, edgecolor='black', zorder=5,
-                        label=f"Optimum: E={bE}, EMA={bL}")
-            cb = figH.colorbar(im, ax=axh, fraction=0.046, pad=0.03)
-            cb.ax.tick_params(colors=TEXT_COLOR, labelsize=7)
-            axh.set_xlabel("Entry threshold E (buy when RSI < E)", color=TEXT_COLOR, fontsize=9)
-            axh.set_ylabel("EMA period", color=TEXT_COLOR, fontsize=9)
-            axh.set_title(ttl + "  —  grey = too few closed trades", color=WHITE, fontsize=11, fontweight='bold')
-            axh.set_facecolor('#475569')
-            axh.legend(facecolor=PANEL_BG2, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8, loc='upper left')
-        figH.patch.set_facecolor(DARK_BG)
-        st.pyplot(figH)
-        plt.close(figH)
-
-    # ---- Main chart: P&L, RSI with entries / exits, price with coloured EMA ----
-    entry_mask = (e_rsi < bE) & ~np.isnan(e_rsi) & b_green
-    entry_days = e_df.index[entry_mask]
-    exit_idx = np.unique([j for j in b_next[entry_mask] if j >= 0]).astype(int)
-    exit_days = e_df.index[exit_idx]
-
-    fig6 = plt.figure(figsize=(16, 14), facecolor=DARK_BG)
-    gs6 = gridspec.GridSpec(3, 1, height_ratios=[1.8, 1.5, 2.1], hspace=0.34)
-    ax1e = fig6.add_subplot(gs6[0]); ax2e = fig6.add_subplot(gs6[1], sharex=ax1e)
-    ax3e = fig6.add_subplot(gs6[2], sharex=ax1e)
-
-    style_ax(ax1e)
-    ax1e.plot(pnl.index, pnl.values, color=GOLD, lw=1.9,
-              label=f"Strategy P&L, marked to market (E={bE}, EMA={bL})")
-    ax1e.plot(bh_pnl.index, bh_pnl.values, '--', color='#94a3b8', lw=1.2,
-              label=f"Buy & Hold with peak capital ₺{peak_cap:,.0f}")
-    ax1e.axhline(0, color=GRID_COLOR, lw=0.8)
-    ax1e.set_ylabel("Cumulative P&L (₺)", color=TEXT_COLOR, fontsize=9)
-    ax1e.set_title(f"Complete Backtest {e_df.index[0].date()} → {e_df.index[-1].date()}  |  "
-                   f"Cumulative profit ₺{bst['total']:,.0f}  ·  {bst['n']} trades",
-                   color=WHITE, fontsize=12, fontweight='bold')
-    ax1e.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8, loc='upper left')
-    ax1n = ax1e.twinx()
-    ax1n.fill_between(n_open.index, n_open.values, 0, step='post', color=CYAN, alpha=0.15)
-    ax1n.set_ylim(0, max(max_conc * 3, 1))
-    ax1n.tick_params(colors=TEXT_COLOR, labelsize=7)
-    ax1n.set_ylabel("Open positions", fontsize=7, color=CYAN)
-    for spine in ax1n.spines.values():
+    style_ax(axA)
+    axA.plot(ha_equity.index, ha_equity.values * 10000, color=GOLD, lw=1.9, label="Heikin-Ashi strategy")
+    axA.plot(bh_equity.index, bh_equity.values * 10000, '--', color='#94a3b8', lw=1.2, label="Buy & Hold")
+    axA.plot(cash_equity.index, cash_equity.values * 10000, ':', color=CYAN, lw=1.2,
+             label=f"Cash ({RISK_FREE_RATE_ANNUAL*100:.0f}% p.a.)")
+    axA.axhline(10000, color=GRID_COLOR, lw=0.8)
+    axA.set_ylabel("Portfolio Value (start 10,000)", color=TEXT_COLOR, fontsize=9)
+    axA.set_title(f"Complete Backtest {data.index[0].date()} → {data.index[-1].date()}  |  "
+                  f"HA {ha_total*100:+.1f}%  ·  Buy & Hold {bh_total*100:+.1f}%",
+                  color=WHITE, fontsize=12, fontweight='bold')
+    axA.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8, loc='upper left')
+    axAd = axA.twinx()
+    dd = (ha_equity / ha_equity.cummax() - 1) * 100
+    axAd.fill_between(dd.index, dd.values, 0, color=RED, alpha=0.13)
+    axAd.set_ylim(-100, 0)
+    axAd.tick_params(colors=TEXT_COLOR, labelsize=7)
+    axAd.set_ylabel("Strategy drawdown %", fontsize=7, color=TEXT_COLOR)
+    for spine in axAd.spines.values():
         spine.set_color(GRID_COLOR)
 
-    style_ax(ax2e)
-    ax2e.plot(e_df.index, e_rsi, color=BLUE, lw=1.1, label=f"RSI({rsi_days_e})")
-    ax2e.axhline(bE, color=GREEN, ls='--', lw=1.0, label=f"Entry: RSI < {bE}")
-    ax2e.scatter(entry_days, e_df.loc[entry_days, 'RSI'], color=GREEN, s=22, zorder=5,
-                 label="Entry day (RSI < E and EMA green)")
-    ax2e.scatter(exit_days, e_df.loc[exit_days, 'RSI'], color=RED, s=26, marker='v', zorder=5,
-                 label="Exit day (EMA turns red)")
-    last_rsi_e = float(e_rsi[-1])
-    ax2e.annotate(f"RSI {last_rsi_e:.1f}", xy=(e_df.index[-1], last_rsi_e), xytext=(8, 8),
-                  textcoords='offset points', color=BLUE, fontsize=8, fontweight='bold')
-    ax2e.set_ylim(0, 100)
-    ax2e.set_ylabel("RSI", color=TEXT_COLOR, fontsize=9)
-    ax2e.set_title("RSI with Entries and Exits", color=WHITE, fontsize=12, fontweight='bold')
-    ax2e.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=7, loc='upper left', ncol=4)
+    style_ax(axB)
+    axB.plot(data.index, data['Close'], color='#cbd5e1', lw=1.1, label="Close")
+    lo, hi = float(data['Low'].min()), float(data['High'].max())
+    axB.fill_between(data.index, lo, hi, where=ha['Green'].values, color=GREEN, alpha=0.10, step='post',
+                     label="HA green (long)")
+    axB.fill_between(data.index, lo, hi, where=~ha['Green'].values, color=RED, alpha=0.06, step='post',
+                     label="HA red (cash)")
+    if len(ha_trades):
+        axB.scatter(ha_trades['entry_date'], ha_trades['entry_price'], marker='^', color=GREEN, s=28,
+                    zorder=5, label="Buy")
+        cl = ha_trades[ha_trades['status'] == "Closed"]
+        axB.scatter(cl['exit_date'], cl['exit_price'], marker='v', color=RED, s=28, zorder=5, label="Sell")
+    axB.set_ylim(lo * 0.98, hi * 1.02)
+    axB.set_title(f"{TICKER} — Price with Heikin-Ashi Colour and Trades", color=WHITE, fontsize=12,
+                  fontweight='bold')
+    axB.set_ylabel("Price", color=TEXT_COLOR, fontsize=9)
+    axB.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8, loc='upper left', ncol=5)
+    fig7.patch.set_facecolor(DARK_BG)
+    st.pyplot(fig7)
+    plt.close(fig7)
 
-    style_ax(ax3e)
-    ax3e.plot(e_df.index, e_df['Close'], color='#cbd5e1', lw=1.1, label="Close")
-    ema_g = b_ema.where(b_green); ema_r = b_ema.where(~b_green)
-    ax3e.plot(e_df.index, ema_g, color=GREEN, lw=1.8, label=f"EMA({bL}) green")
-    ax3e.plot(e_df.index, ema_r, color=RED, lw=1.8, label=f"EMA({bL}) red")
-    ax3e.scatter(entry_days, e_df.loc[entry_days, 'Close'], marker='^', color=GREEN, s=55, zorder=5,
-                 edgecolor='white', linewidth=0.5, label="Buy")
-    ax3e.scatter(exit_days, e_df.loc[exit_days, 'Close'], marker='v', color=RED, s=60, zorder=5,
-                 edgecolor='white', linewidth=0.5, label="Sell (all open positions)")
-    ax3e.set_title(f"{TICKER} — Price, EMA({bL}) Colour and Buy / Sell Days",
-                   color=WHITE, fontsize=12, fontweight='bold')
-    ax3e.set_ylabel("Price", color=TEXT_COLOR, fontsize=9)
-    ax3e.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8, loc='upper left', ncol=3)
-    fig6.patch.set_facecolor(DARK_BG)
-    st.pyplot(fig6)
-    plt.close(fig6)
+    # ---- Heikin-Ashi candles, recent period ----
+    st.markdown(f"#### 🕯️ Heikin-Ashi Candles — Last {ha_zoom_days} Days")
+    ha_z = ha.iloc[-ha_zoom_days:]
+    fig8, ax8 = plt.subplots(figsize=(16, 5), facecolor=DARK_BG)
+    style_ax(ax8, PANEL_BG2)
+    draw_ha_candles(ax8, ha_z)
+    ax8.plot(ha_z.index, data['Close'].iloc[-ha_zoom_days:], color=WHITE, lw=0.8, alpha=0.6, label="Actual close")
+    ax8.set_ylabel("Price", color=TEXT_COLOR, fontsize=9)
+    ax8.legend(facecolor=PANEL_BG2, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8, loc='upper left')
+    ax8.autoscale_view()
+    fig8.patch.set_facecolor(DARK_BG)
+    st.pyplot(fig8)
+    plt.close(fig8)
 
-    # ---- Current state ----
-    st.markdown("#### 📍 Current State")
-    is_green_now = bool(b_green[-1])
-    c1e, c2e, c3e, c4e = st.columns(4)
-    c1e.metric("Last Close", f"{float(e_df['Close'].iloc[-1]):.2f}")
-    c2e.metric("Current RSI", f"{last_rsi_e:.1f}")
-    c3e.metric(f"EMA({bL})", f"{float(b_ema.iloc[-1]):.2f}", delta="🟢 green" if is_green_now else "🔴 red",
-               delta_color="off")
-    if last_rsi_e < bE and is_green_now:
-        c4e.success(f"🟢 BUY today — RSI {last_rsi_e:.1f} < {bE} and EMA green")
-    elif not is_green_now:
-        c4e.error("🔴 EMA red — no entries; any open positions are sold")
+    # ---- Current signal ----
+    st.markdown("#### 📍 Current Signal")
+    last_green = bool(ha['Green'].iloc[-1]); prev_green = bool(ha['Green'].iloc[-2])
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Last Close", f"{float(data['Close'].iloc[-1]):.2f}")
+    k2.metric("HA Open / Close", f"{ha['HA_Open'].iloc[-1]:.2f} / {ha['HA_Close'].iloc[-1]:.2f}")
+    streak = int((ha['Green'] != ha['Green'].shift()).cumsum().value_counts().loc[
+        (ha['Green'] != ha['Green'].shift()).cumsum().iloc[-1]])
+    k3.metric("Bar colour", "🟢 Green" if last_green else "🔴 Red", delta=f"{streak} bar(s) in a row",
+              delta_color="off")
+    if last_green and not prev_green:
+        k4.success("🟢 BUY — bar turned green today")
+    elif not last_green and prev_green:
+        k4.error("🔴 SELL — bar turned red today; move to cash")
+    elif last_green:
+        k4.info("🟢 HOLD LONG")
     else:
-        c4e.info(f"⚪ EMA green, RSI {last_rsi_e:.1f} ≥ {bE} — hold open positions, no new entry")
-    open_pos = best_trades[best_trades['status'] != "Closed"] if len(best_trades) else best_trades
-    if len(open_pos):
-        op = open_pos[['entry_date', 'entry_price', 'entry_rsi', 'held_days', 'net_ret']].copy()
-        op['entry_price'] = op['entry_price'].round(2); op['entry_rsi'] = op['entry_rsi'].round(1)
-        op['net_ret'] = (op['net_ret'] * 100).round(2).astype(str) + '%'
-        op.columns = ['Entry', 'Entry Px', 'Entry RSI', 'Days open', 'Unrealised %']
-        st.markdown(f"**{len(op)} open position(s)** — all will be sold when the EMA turns red:")
-        st.dataframe(op, use_container_width=True, hide_index=True)
-    else:
-        st.caption("No open positions.")
+        k4.info("⚪ STAY IN CASH")
+
+    # ---- Performance summary ----
+    st.markdown("#### 📊 Performance Summary")
+    cash_held = pd.Series(0.0, index=data.index)
+    st.dataframe(pd.DataFrame([
+        equity_stats(ha_equity, ha_rets, RISK_FREE_RATE_ANNUAL, ha_held, ha_trades, "Heikin-Ashi"),
+        equity_stats(bh_equity, bh_rets, RISK_FREE_RATE_ANNUAL, pd.Series(1.0, index=data.index), None, "Buy & Hold"),
+        equity_stats(cash_equity, cash_rets, RISK_FREE_RATE_ANNUAL, cash_held, None, "Cash (risk-free)"),
+    ]).set_index("Strategy"), use_container_width=True)
+    st.caption("Sharpe uses daily returns in excess of the risk-free rate (cash therefore has no Sharpe). "
+               "Calmar = CAGR / |max drawdown|. A still-open position is valued at the last close and "
+               "excluded from the trade statistics.")
+
+    # ---- Calendar-year returns ----
+    st.markdown("#### 📅 Calendar-Year Returns")
+    yr = pd.DataFrame({
+        "Heikin-Ashi": (1 + ha_rets).groupby(ha_rets.index.year).prod() - 1,
+        "Buy & Hold": (1 + bh_rets).groupby(bh_rets.index.year).prod() - 1,
+        "Cash": (1 + cash_rets).groupby(cash_rets.index.year).prod() - 1,
+    })
+    yr["HA − B&H"] = yr["Heikin-Ashi"] - yr["Buy & Hold"]
+    st.dataframe((yr * 100).round(1).astype(str) + "%", use_container_width=True)
 
     # ---- Trade log ----
-    with st.expander(f"📋 Trade Log — E={bE}, EMA={bL}  ({len(best_trades)} trades)"):
-        if len(best_trades):
-            tl = best_trades[['entry_date', 'exit_date', 'entry_rsi', 'entry_price', 'exit_price',
-                              'held_days', 'net_ret', 'status']].copy()
-            tl['entry_rsi'] = tl['entry_rsi'].round(1)
+    with st.expander(f"📋 Trade Log ({len(ha_trades)} trades)"):
+        if len(ha_trades):
+            tl = ha_trades[['entry_date', 'exit_date', 'entry_price', 'exit_price', 'held_days',
+                            'net_ret', 'status']].copy()
             tl['entry_price'] = tl['entry_price'].round(2); tl['exit_price'] = tl['exit_price'].round(2)
             tl['net_ret'] = (tl['net_ret'] * 100).round(2)
-            tl.columns = ['Entry', 'Exit', 'Entry RSI', 'Entry Px', 'Exit Px', 'Days', 'Net Ret %', 'Status']
+            tl.columns = ['Entry', 'Exit', 'Entry Px', 'Exit Px', 'Days', 'Net Ret %', 'Status']
             st.dataframe(tl, use_container_width=True, hide_index=True)
             st.download_button("⬇️ Download trade log (CSV)", tl.to_csv(index=False).encode("utf-8"),
-                               file_name=f"{TICKER}_rsi_ema_trades.csv", mime="text/csv")
+                               file_name=f"{TICKER}_heikin_ashi_trades.csv", mime="text/csv")
         else:
             st.info("No trades generated.")
 
-    # ---- Top settings ----
-    st.markdown("#### 📊 Top 10 Settings")
-    top = e_grid.dropna(subset=['score']).sort_values(['score', 'total'], ascending=False).head(10)
-    st.dataframe(pd.DataFrame({
-        "Entry RSI <": top['Entry RSI <'], "EMA": top['EMA'],
-        "Cumulative profit (₺)": top['total'].round(0),
-        "Avg net / trade": (top['avg'] * 100).round(2).astype(str) + '%',
-        "Closed": top['n_closed'], "Open": top['n_open'],
-        "Win rate": (top['win'] * 100).round(0).astype(str) + '%',
-        "Avg hold (days)": top['hold'].round(1),
-    }), use_container_width=True, hide_index=True)
-
-    # ---- Optional hold-out check ----
-    st.markdown("#### 🧪 Hold-out Check (optional)")
-    st.caption(
-        f"The optimum above is the best of {len(entry_grid) * len(ema_grid)} settings on the same data, "
-        "so its profit is optimistic. This check chooses (E, EMA) on the first 75% of the period only "
-        "and applies it, unchanged, to the last 25%.")
-    if st.checkbox("Run hold-out check", value=False, key="e_holdout"):
-        split = int(len(data) * 0.75)
-        with st.spinner("Optimising on the first 75%…"):
-            _, _, tr_grid = cached_optimise_rsi_ema(
-                data.iloc[:split], rsi_days_e, entry_grid, ema_grid, e_green_rule, exec_e,
-                float(e_position_size), e_objective, e_min_trades)
-        tb = best_from_grid(tr_grid)
-        if tb is None:
-            st.warning("Not enough trades in the first 75% to choose a setting.")
-        else:
-            tE, tL = int(tb['Entry RSI <']), int(tb['EMA'])
-            g_t, _ = ema_green(e_df['Close'], tL, e_green_rule)
-            full_tr = rsi_ema_trades(e_df, e_rsi, g_t, next_red_index(g_t), tE, exec_e)
-            split_date = data.index[split]
-            test_tr = full_tr[full_tr['entry_date'] >= split_date] if len(full_tr) else full_tr
-            ts = multi_trade_stats(test_tr, e_position_size)
-            h1c, h2c, h3c, h4c = st.columns(4)
-            h1c.metric("Chosen on first 75%", f"E={tE}, EMA={tL}")
-            h2c.metric("Hold-out cumulative profit", f"₺{ts['total']:,.0f}")
-            h3c.metric("Hold-out avg / trade", f"{ts['avg']*100:.2f}%" if ts['n'] else "N/A")
-            h4c.metric("Hold-out trades (closed / open)", f"{ts['n_closed']} / {ts['n_open']}")
-            st.caption(f"Hold-out period: {split_date.date()} → {data.index[-1].date()}. "
-                       "Trades entered in the hold-out period are counted; exits use the full price path.")
-
-st.caption("Developed for educational and research purposes — RSI Pivot + Long/Short + RSI/EMA Strategy Suite.")
+st.caption("Developed for educational and research purposes — RSI Pivot + Long/Short + Heikin-Ashi Strategy Suite.")
 
 
 

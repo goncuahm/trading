@@ -836,62 +836,112 @@ with tab3:
     m4.metric("Closed Trades", n_closed)
     m5.metric("Time in Market", f"{cf_df['Position'].mean()*100:.0f}%")
 
-    # ---- Main chart: price + signals, RSI + forecast, equity ----
-    fig4 = plt.figure(figsize=(16, 13), facecolor=DARK_BG)
-    gs = gridspec.GridSpec(3, 1, height_ratios=[2.2, 1.3, 1.8], hspace=0.32)
-    axP = fig4.add_subplot(gs[0]); axR = fig4.add_subplot(gs[1], sharex=axP)
-    axE = fig4.add_subplot(gs[2], sharex=axP)
+    # ---- Main chart: (1) full-period backtest, (2) RSI + forecast RSI, (3) price + signals ----
+    # Forecast made on day t for day t+h, plotted at the date it refers to (t+h).
+    fc_aligned = cf_df['RSI_fc'].shift(cf_horizon)
+    bdays = pd.bdate_range(cf_df.index[-1], periods=cf_horizon + 1)[1:]
+    fc_future = pd.Series(cf_df['RSI_fc'].values[-cf_horizon:], index=bdays)
 
-    style_ax(axP)
-    axP.plot(cf_df.index, cf_df['Close'], color='#cbd5e1', lw=1.2, label="Close")
-    in_mkt = cf_df['Position'].values.astype(bool)
-    axP.fill_between(cf_df.index, cf_df['Close'].min(), cf_df['Close'].max(),
-                     where=in_mkt, color=GREEN, alpha=0.07, step='post', label="Long (signal)")
-    b_idx = cf_df.index[cf_df['BuySig']]; s_idx = cf_df.index[cf_df['SellSig']]
-    axP.scatter(b_idx, cf_df.loc[b_idx, 'Close'], marker='^', color=GREEN, s=90, zorder=5,
-                label="Buy signal (oversold + forecast up)")
-    axP.scatter(s_idx, cf_df.loc[s_idx, 'Close'], marker='v', color=RED, s=90, zorder=5,
-                label="Sell signal (overbought + forecast down)")
-    axP.set_title(f"{TICKER} — Price with Cubic-Forecast RSI Signals", color=WHITE,
-                  fontsize=12, fontweight='bold')
-    axP.set_ylabel("Price", color=TEXT_COLOR, fontsize=9)
-    axP.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8, loc='upper left')
+    fig4 = plt.figure(figsize=(16, 14), facecolor=DARK_BG)
+    gs = gridspec.GridSpec(3, 1, height_ratios=[1.9, 1.6, 1.9], hspace=0.34)
+    axE = fig4.add_subplot(gs[0])
+    axR = fig4.add_subplot(gs[1], sharex=axE)
+    axP = fig4.add_subplot(gs[2], sharex=axE)
 
-    style_ax(axR)
-    axR.plot(cf_df.index, cf_df['RSI'], color=BLUE, lw=1.1, label=f"RSI({rsi_days_cf})")
-    axR.axhline(cf_oversold, color=GREEN, ls='--', lw=0.9, label=f"Oversold {cf_oversold}")
-    axR.axhline(cf_overbought, color=RED, ls='--', lw=0.9, label=f"Overbought {cf_overbought}")
-    axR.fill_between(cf_df.index, 0, 100, where=cf_df['ArmedBuy'].values, color=GREEN, alpha=0.10,
-                     step='post', label="Buy setup armed")
-    axR.fill_between(cf_df.index, 0, 100, where=cf_df['ArmedSell'].values, color=RED, alpha=0.10,
-                     step='post', label="Sell setup armed")
-    axR.scatter(b_idx, cf_df.loc[b_idx, 'RSI'], marker='^', color=GREEN, s=50, zorder=5)
-    axR.scatter(s_idx, cf_df.loc[s_idx, 'RSI'], marker='v', color=RED, s=50, zorder=5)
-    axR.set_ylim(0, 100)
-    axR.set_ylabel("RSI", color=TEXT_COLOR, fontsize=9)
-    axR.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=7,
-               loc='upper left', ncol=5)
-
+    # (1) Complete backtest — whole period, no in-sample / out-of-sample split
     style_ax(axE)
-    axE.plot(cf_equity.index, cf_equity.values * 10000, color=GOLD, lw=1.8, label="Cubic-forecast strategy")
-    axE.plot(base_equity.index, base_equity.values * 10000, color=CYAN, lw=1.2, alpha=0.8,
-             label="Baseline (no cubic filter)")
-    axE.plot(bh_equity.index, bh_equity.values * 10000, '--', color='#64748b', lw=1.2, label="Buy & Hold")
+    axE.plot(cf_equity.index, cf_equity.values * 10000, color=GOLD, lw=1.9, label="RSI + cubic forecast")
+    axE.plot(base_equity.index, base_equity.values * 10000, color=CYAN, lw=1.2, alpha=0.85,
+             label="Baseline (RSI thresholds only)")
+    axE.plot(bh_equity.index, bh_equity.values * 10000, '--', color='#94a3b8', lw=1.2, label="Buy & Hold")
+    axE.axhline(10000, color=GRID_COLOR, lw=0.8, ls=':')
     axE.set_ylabel("Portfolio Value (start 10,000)", color=TEXT_COLOR, fontsize=9)
-    axE.set_title("Portfolio Value Comparison", color=WHITE, fontsize=12, fontweight='bold')
+    axE.set_title(
+        f"Complete Backtest {cf_df.index[0].date()} → {cf_df.index[-1].date()}  "
+        f"(rule-based, no train/test split)  |  Strategy {cf_total*100:+.1f}%  ·  "
+        f"Buy & Hold {bh_total*100:+.1f}%", color=WHITE, fontsize=12, fontweight='bold')
     axE.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8, loc='upper left')
     axEd = axE.twinx()
     dd_series = (cf_equity / cf_equity.cummax() - 1) * 100
-    axEd.fill_between(dd_series.index, dd_series.values, 0, color=RED, alpha=0.15)
+    axEd.fill_between(dd_series.index, dd_series.values, 0, color=RED, alpha=0.13)
     axEd.set_ylim(-100, 0)
     axEd.tick_params(colors=TEXT_COLOR, labelsize=7)
     axEd.set_ylabel("Strategy drawdown %", fontsize=7, color=TEXT_COLOR)
     for spine in axEd.spines.values():
         spine.set_color(GRID_COLOR)
 
+    # (2) RSI and cubic-forecast RSI over the backtest period
+    style_ax(axR)
+    axR.fill_between(cf_df.index, 0, 100, where=cf_df['ArmedBuy'].values, color=GREEN, alpha=0.10,
+                     step='post', label="Buy setup armed")
+    axR.fill_between(cf_df.index, 0, 100, where=cf_df['ArmedSell'].values, color=RED, alpha=0.10,
+                     step='post', label="Sell setup armed")
+    axR.plot(cf_df.index, cf_df['RSI'], color=BLUE, lw=1.2, label=f"RSI({rsi_days_cf})")
+    axR.plot(fc_aligned.index, fc_aligned.values, color=ORANGE, lw=0.9, alpha=0.9,
+             label=f"Cubic forecast RSI (made {cf_horizon} day(s) earlier)")
+    axR.plot(fc_future.index, fc_future.values, '*', color=ORANGE, ms=11,
+             label=f"Forecast for next {cf_horizon} day(s): {fc_future.iloc[-1]:.1f}")
+    axR.axhline(cf_oversold, color=GREEN, ls='--', lw=0.9, label=f"Oversold {cf_oversold}")
+    axR.axhline(cf_overbought, color=RED, ls='--', lw=0.9, label=f"Overbought {cf_overbought}")
+    b_idx = cf_df.index[cf_df['BuySig']]; s_idx = cf_df.index[cf_df['SellSig']]
+    axR.scatter(b_idx, cf_df.loc[b_idx, 'RSI'], marker='^', color=GREEN, s=55, zorder=5)
+    axR.scatter(s_idx, cf_df.loc[s_idx, 'RSI'], marker='v', color=RED, s=55, zorder=5)
+    last_rsi_v = float(cf_df['RSI'].iloc[-1])
+    axR.annotate(f"RSI {last_rsi_v:.1f}", xy=(cf_df.index[-1], last_rsi_v),
+                 xytext=(8, 10), textcoords='offset points', color=BLUE, fontsize=8, fontweight='bold')
+    axR.annotate(f"Fcst {fc_future.iloc[-1]:.1f}", xy=(fc_future.index[-1], fc_future.iloc[-1]),
+                 xytext=(8, -14), textcoords='offset points', color=ORANGE, fontsize=8, fontweight='bold')
+    axR.set_ylim(0, 100)
+    axR.set_ylabel("RSI", color=TEXT_COLOR, fontsize=9)
+    axR.set_title("RSI and Cubic-Polynomial Forecast of the RSI", color=WHITE, fontsize=12, fontweight='bold')
+    axR.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=7,
+               loc='upper left', ncol=4)
+
+    # (3) Price with executed signals
+    style_ax(axP)
+    axP.plot(cf_df.index, cf_df['Close'], color='#cbd5e1', lw=1.2, label="Close")
+    in_mkt = cf_df['Position'].values.astype(bool)
+    axP.fill_between(cf_df.index, cf_df['Close'].min(), cf_df['Close'].max(),
+                     where=in_mkt, color=GREEN, alpha=0.07, step='post', label="Long (signal)")
+    axP.scatter(b_idx, cf_df.loc[b_idx, 'Close'], marker='^', color=GREEN, s=90, zorder=5,
+                label="Buy (oversold + forecast up)")
+    axP.scatter(s_idx, cf_df.loc[s_idx, 'Close'], marker='v', color=RED, s=90, zorder=5,
+                label="Sell (overbought + forecast down)")
+    axP.set_title(f"{TICKER} — Price with Signals", color=WHITE, fontsize=12, fontweight='bold')
+    axP.set_ylabel("Price", color=TEXT_COLOR, fontsize=9)
+    axP.legend(facecolor=PANEL_BG, edgecolor=GRID_COLOR, labelcolor=WHITE, fontsize=8, loc='upper left')
+
     fig4.patch.set_facecolor(DARK_BG)
     st.pyplot(fig4)
     plt.close(fig4)
+
+    # ---- RSI and forecast values (printed) ----
+    st.markdown("#### 🔢 RSI and Cubic-Forecast RSI — Daily Values")
+    state = np.where(cf_df['BuySig'], "BUY",
+             np.where(cf_df['SellSig'], "SELL",
+              np.where(cf_df['Position'] == 1,
+                       np.where(cf_df['ArmedSell'], "Long · exit armed", "Long"),
+                       np.where(cf_df['ArmedBuy'], "Flat · buy armed", "Flat"))))
+    rsi_table = pd.DataFrame({
+        "Close": cf_df['Close'].round(2),
+        "RSI": cf_df['RSI'].round(2),
+        f"Forecast RSI t+{cf_horizon} (made today)": cf_df['RSI_fc'].round(2),
+        "Forecast − RSI": (cf_df['RSI_fc'] - cf_df['RSI']).round(2),
+        "Direction": np.where(cf_df['RSI_fc'] > cf_df['RSI'], "↗ up",
+                              np.where(cf_df['RSI_fc'] < cf_df['RSI'], "↘ down", "")),
+        f"Forecast made {cf_horizon}d earlier for today": fc_aligned.round(2),
+        "Signal / State": state,
+    }, index=cf_df.index)
+    rsi_table.index = rsi_table.index.date
+    rsi_table.index.name = "Date"
+    rsi_table = rsi_table.dropna(subset=["RSI"])
+    n_show = st.slider("Days to show (most recent first)", 10, len(rsi_table),
+                       min(30, len(rsi_table)), key="cf_rows")
+    st.dataframe(rsi_table.iloc[::-1].head(n_show), use_container_width=True)
+    st.download_button(
+        "⬇️ Download full RSI / forecast table (CSV)",
+        rsi_table.to_csv().encode("utf-8"),
+        file_name=f"{TICKER}_rsi_cubic_forecast.csv", mime="text/csv")
 
     # ---- Latest cubic fit (illustration of the current forecast) ----
     st.markdown("#### 🔍 Latest Cubic Fit of the RSI")
